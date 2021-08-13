@@ -71,7 +71,12 @@ impl Dispatcher {
     }
 
     /// Dispatch a command by name with JSON arguments
-    pub fn dispatch(&mut self, name: &str, args: &str, project: &mut Project) -> Result<CommandResult> {
+    pub fn dispatch(
+        &mut self,
+        name: &str,
+        args: &str,
+        project: &mut Project,
+    ) -> Result<CommandResult> {
         let factory = self
             .registry
             .get(name)
@@ -84,10 +89,10 @@ impl Dispatcher {
         if modified && undoable {
             // Clear redo stack on new action
             self.redo_stack.clear();
-            
+
             // Add to undo stack
             self.undo_stack.push(command);
-            
+
             // Truncate if needed
             if self.undo_stack.len() > self.max_undo {
                 self.undo_stack.remove(0);
@@ -105,7 +110,7 @@ impl Dispatcher {
         if modified && undoable {
             self.redo_stack.clear();
             self.undo_stack.push(command);
-            
+
             if self.undo_stack.len() > self.max_undo {
                 self.undo_stack.remove(0);
             }
@@ -288,7 +293,7 @@ mod tests {
 
         let cmd = Box::new(TestCommand);
         let result = dispatcher.execute(cmd, &mut project).unwrap();
-        
+
         assert!(result.modified);
         assert!(dispatcher.can_undo());
     }

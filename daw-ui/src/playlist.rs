@@ -8,6 +8,11 @@ const TRACK_HEADER_WIDTH: f32 = 164.0;
 const TRACK_HEIGHT: f32 = 72.0;
 const TRACK_GAP: f32 = 6.0;
 const BAR_WIDTH: f32 = 120.0;
+const BEAT_WIDTH: f32 = BAR_WIDTH / 4.0;
+const SNAP_BEATS: f32 = 0.25;
+const MIN_CLIP_LENGTH: f32 = SNAP_BEATS;
+const RESIZE_HANDLE_WIDTH: f32 = 8.0;
+const CLIP_VERTICAL_PADDING: f32 = 12.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrackKind {
@@ -35,22 +40,76 @@ pub struct PianoRollTrackSnapshot {
 pub struct PlaylistView {
     active_tool: PlaylistTool,
     selected_track: usize,
+    selected_clip: Option<ClipSelection>,
+    clip_drag: Option<ClipDrag>,
+    next_clip_id: usize,
     tracks: Vec<PlaylistTrack>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClipSelection {
+    track_index: usize,
+    clip_id: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClipDrag {
+    track_index: usize,
+    clip_id: usize,
+    mode: ClipDragMode,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ClipDragMode {
+    Create {
+        anchor_beat: f32,
+    },
+    Move {
+        beat_offset: f32,
+        length_beats: f32,
+    },
+    Resize {
+        edge: ResizeEdge,
+        fixed_beat: f32,
+        edge_offset: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeEdge {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClipHit {
+    track_index: usize,
+    clip_id: usize,
+    edge: Option<ResizeEdge>,
 }
 
 impl PlaylistView {
     pub fn new() -> Self {
+        let tracks = sample_tracks();
+        let next_clip_id = tracks
+            .iter()
+            .flat_map(|track| track.clips.iter().map(|clip| clip.id))
+            .max()
+            .map_or(0, |id| id + 1);
         Self {
             active_tool: PlaylistTool::Select,
             selected_track: 0,
-            tracks: sample_tracks(),
+            selected_clip: None,
+            clip_drag: None,
+            next_clip_id,
+            tracks,
         }
     }
 
     pub fn active_track_name(&self) -> &str {
         self.tracks
             .get(self.selected_track)
-            .map(|track| track.name)
+            .map(|track| track.name.as_str())
             .unwrap_or("Playlist Track")
     }
 
@@ -129,6 +188,7 @@ impl PlaylistView {
             egui::Stroke::new(1.0, theme::BORDER),
         );
 
+        let selected_clip_summary = self.selected_clip_summary();
         let toolbar_rect = egui::Rect::from_min_max(
             egui::pos2(rect.left() + TRACK_HEADER_WIDTH + 8.0, rect.top() + 6.0),
             egui::pos2(rect.right() - 8.0, rect.bottom() - 6.0),
@@ -138,10 +198,31 @@ impl PlaylistView {
                 ui.spacing_mut().item_spacing.x = 6.0;
 
                 for tool in PlaylistTool::ALL {
-                    let response = tool_button(ui, tool, self.active_tool == tool);
+                    let response = tool_button(
+                        ui,
+                        tool.icon(),
+                        tool.label(),
+                        self.active_tool == tool,
+                        true,
+                    );
                     if response.clicked() {
                         self.active_tool = tool;
+                        self.clip_drag = None;
                     }
+                }
+
+                ui.separator();
+                status_chip(ui, "Snap 1/16");
+                status_chip(
+                    ui,
+                    if ui.input(|input| input.modifiers.alt) {
+                        "Free Drag"
+                    } else {
+                        "Quantized"
+                    },
+                );
+                if let Some(summary) = &selected_clip_summary {
+                    status_chip(ui, summary);
                 }
             });
         });
@@ -149,7 +230,7 @@ impl PlaylistView {
 
     fn show_body(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size_before_wrap();
-        let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let painter = ui.painter().clone();
 
         painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::SURFACE_0);
@@ -169,6 +250,8 @@ impl PlaylistView {
             egui::pos2(sidebar_rect.right(), track_area_rect.top()),
             track_area_rect.max,
         );
+
+        self.handle_clip_interactions(ui, sidebar_rect, grid_rect);
 
         painter.rect_filled(timeline_rect, egui::CornerRadius::ZERO, theme::SURFACE_1);
         painter.rect_filled(sidebar_rect, egui::CornerRadius::ZERO, theme::SURFACE_1);
@@ -190,13 +273,412 @@ impl PlaylistView {
         draw_timeline(&painter, timeline_rect, TRACK_HEADER_WIDTH);
         draw_grid(&painter, grid_rect, self.tracks.len());
         draw_tracks(
-            ui,
             &painter,
             sidebar_rect,
             grid_rect,
             &self.tracks,
-            &mut self.selected_track,
+            self.selected_track,
+            self.selected_clip,
         );
+    }
+
+    fn handle_clip_interactions(
+        &mut self,
+        ui: &mut egui::Ui,
+        sidebar_rect: egui::Rect,
+        grid_rect: egui::Rect,
+    ) {
+        let pointer_pos = ui.input(|input| input.pointer.interact_pos());
+        let pointer_in_sidebar = pointer_pos.is_some_and(|pos| sidebar_rect.contains(pos));
+        let pointer_in_grid = pointer_pos.is_some_and(|pos| grid_rect.contains(pos));
+
+        if pointer_in_grid {
+            if let Some(pos) = pointer_pos {
+                let hit = clip_hit_test(grid_rect, &self.tracks, pos);
+                match self.active_tool {
+                    PlaylistTool::Select | PlaylistTool::Draw => match hit {
+                        Some(ClipHit { edge: Some(_), .. }) => ui.output_mut(|output| {
+                            output.cursor_icon = egui::CursorIcon::ResizeHorizontal;
+                        }),
+                        Some(_) => ui.output_mut(|output| {
+                            output.cursor_icon = egui::CursorIcon::Grab;
+                        }),
+                        None if self.active_tool == PlaylistTool::Draw => ui.output_mut(|output| {
+                            output.cursor_icon = egui::CursorIcon::Crosshair;
+                        }),
+                        None => {}
+                    },
+                    PlaylistTool::Split => {
+                        if hit.is_some() {
+                            ui.output_mut(|output| {
+                                output.cursor_icon = egui::CursorIcon::Crosshair;
+                            });
+                        }
+                    }
+                    PlaylistTool::Duplicate | PlaylistTool::Mute => {
+                        if hit.is_some() {
+                            ui.output_mut(|output| {
+                                output.cursor_icon = egui::CursorIcon::PointingHand;
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let free_drag = ui.input(|input| input.modifiers.alt);
+        let primary_pressed =
+            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+        if primary_pressed {
+            if let Some(pos) = pointer_pos {
+                if pointer_in_sidebar {
+                    if let Some(track_index) = pos_to_track(sidebar_rect, pos, self.tracks.len()) {
+                        self.selected_track = track_index;
+                        self.selected_clip = None;
+                        self.clip_drag = None;
+                    }
+                } else if pointer_in_grid {
+                    self.handle_grid_primary_pressed(grid_rect, pos, free_drag);
+                } else {
+                    self.clip_drag = None;
+                }
+            }
+        }
+
+        let secondary_pressed =
+            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary));
+        if secondary_pressed && pointer_in_grid {
+            if let Some(pos) = pointer_pos {
+                if let Some(hit) = clip_hit_test(grid_rect, &self.tracks, pos) {
+                    self.remove_clip(hit.track_index, hit.clip_id);
+                }
+            }
+        }
+
+        let primary_down =
+            ui.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+        if primary_down {
+            if let Some(pos) = pointer_pos {
+                let pointer_beat = pos_to_beat(grid_rect, pos);
+                self.update_clip_drag(pointer_beat, grid_rect, free_drag);
+            }
+        } else if self.clip_drag.is_some() {
+            self.finish_clip_drag();
+        }
+    }
+
+    fn handle_grid_primary_pressed(
+        &mut self,
+        grid_rect: egui::Rect,
+        pointer_pos: egui::Pos2,
+        free_drag: bool,
+    ) {
+        let pointer_beat = pos_to_beat(grid_rect, pointer_pos);
+        let pointer_track = pos_to_track(grid_rect, pointer_pos, self.tracks.len());
+        let hit = clip_hit_test(grid_rect, &self.tracks, pointer_pos);
+
+        match self.active_tool {
+            PlaylistTool::Select => {
+                if let Some(hit) = hit {
+                    self.selected_track = hit.track_index;
+                    self.selected_clip = Some(ClipSelection {
+                        track_index: hit.track_index,
+                        clip_id: hit.clip_id,
+                    });
+                    self.begin_clip_drag_from_hit(hit, pointer_beat, free_drag, grid_rect);
+                } else if let Some(track_index) = pointer_track {
+                    self.selected_track = track_index;
+                    self.selected_clip = None;
+                    self.clip_drag = None;
+                }
+            }
+            PlaylistTool::Draw => {
+                if let Some(hit) = hit {
+                    self.selected_track = hit.track_index;
+                    self.selected_clip = Some(ClipSelection {
+                        track_index: hit.track_index,
+                        clip_id: hit.clip_id,
+                    });
+                    self.begin_clip_drag_from_hit(hit, pointer_beat, free_drag, grid_rect);
+                } else if let Some(track_index) = pointer_track {
+                    self.selected_track = track_index;
+                    let clip_id =
+                        self.create_clip(track_index, quantize_beat(pointer_beat, free_drag));
+                    self.selected_clip = Some(ClipSelection {
+                        track_index,
+                        clip_id,
+                    });
+                    self.clip_drag = Some(ClipDrag {
+                        track_index,
+                        clip_id,
+                        mode: ClipDragMode::Create {
+                            anchor_beat: quantize_beat(pointer_beat, free_drag),
+                        },
+                    });
+                    self.update_clip_drag(pointer_beat, grid_rect, free_drag);
+                }
+            }
+            PlaylistTool::Split => {
+                self.clip_drag = None;
+                if let Some(hit) = hit {
+                    self.selected_track = hit.track_index;
+                    self.selected_clip = Some(ClipSelection {
+                        track_index: hit.track_index,
+                        clip_id: hit.clip_id,
+                    });
+                    self.split_clip(
+                        hit.track_index,
+                        hit.clip_id,
+                        quantize_beat(pointer_beat, free_drag),
+                    );
+                } else if let Some(track_index) = pointer_track {
+                    self.selected_track = track_index;
+                    self.selected_clip = None;
+                }
+            }
+            PlaylistTool::Duplicate => {
+                self.clip_drag = None;
+                if let Some(hit) = hit {
+                    self.selected_track = hit.track_index;
+                    self.selected_clip = self.duplicate_clip(hit.track_index, hit.clip_id);
+                } else if let Some(track_index) = pointer_track {
+                    self.selected_track = track_index;
+                    self.selected_clip = None;
+                }
+            }
+            PlaylistTool::Mute => {
+                self.clip_drag = None;
+                if let Some(hit) = hit {
+                    self.selected_track = hit.track_index;
+                    self.toggle_clip_mute(hit.track_index, hit.clip_id);
+                    self.selected_clip = Some(ClipSelection {
+                        track_index: hit.track_index,
+                        clip_id: hit.clip_id,
+                    });
+                } else if let Some(track_index) = pointer_track {
+                    self.selected_track = track_index;
+                    self.selected_clip = None;
+                }
+            }
+        }
+    }
+
+    fn begin_clip_drag_from_hit(
+        &mut self,
+        hit: ClipHit,
+        pointer_beat: f32,
+        free_drag: bool,
+        grid_rect: egui::Rect,
+    ) {
+        let Some(clip) = self.clip(hit.track_index, hit.clip_id).cloned() else {
+            self.clip_drag = None;
+            return;
+        };
+
+        let mode = match hit.edge {
+            Some(edge) => {
+                let edge_beat = match edge {
+                    ResizeEdge::Start => clip.start_beat,
+                    ResizeEdge::End => clip.start_beat + clip.length_beats,
+                };
+                ClipDragMode::Resize {
+                    edge,
+                    fixed_beat: match edge {
+                        ResizeEdge::Start => clip.start_beat + clip.length_beats,
+                        ResizeEdge::End => clip.start_beat,
+                    },
+                    edge_offset: edge_beat - pointer_beat,
+                }
+            }
+            None => ClipDragMode::Move {
+                beat_offset: pointer_beat - clip.start_beat,
+                length_beats: clip.length_beats,
+            },
+        };
+
+        self.clip_drag = Some(ClipDrag {
+            track_index: hit.track_index,
+            clip_id: hit.clip_id,
+            mode,
+        });
+        self.update_clip_drag(pointer_beat, grid_rect, free_drag);
+    }
+
+    fn update_clip_drag(&mut self, pointer_beat: f32, grid_rect: egui::Rect, free_drag: bool) {
+        let Some(drag) = self.clip_drag else {
+            return;
+        };
+        let grid_beats = grid_total_beats(grid_rect);
+        let Some(clip) = self.clip_mut(drag.track_index, drag.clip_id) else {
+            self.clip_drag = None;
+            return;
+        };
+
+        match drag.mode {
+            ClipDragMode::Create { anchor_beat } => {
+                let dragged_beat = quantize_beat(pointer_beat, free_drag);
+                let start = anchor_beat.min(dragged_beat);
+                let end = anchor_beat.max(dragged_beat).max(start + MIN_CLIP_LENGTH);
+                clip.start_beat = start.clamp(0.0, (grid_beats - MIN_CLIP_LENGTH).max(0.0));
+                clip.length_beats =
+                    clamp_clip_length(end - clip.start_beat, clip.start_beat, grid_beats);
+            }
+            ClipDragMode::Move {
+                beat_offset,
+                length_beats,
+            } => {
+                let start = quantize_beat(pointer_beat - beat_offset, free_drag);
+                clip.start_beat = clamp_start_beat(start, length_beats, grid_beats);
+                clip.length_beats = clamp_clip_length(length_beats, clip.start_beat, grid_beats);
+            }
+            ClipDragMode::Resize {
+                edge,
+                fixed_beat,
+                edge_offset,
+            } => {
+                let edge_beat = quantize_beat(pointer_beat + edge_offset, free_drag);
+                match edge {
+                    ResizeEdge::Start => {
+                        let start = edge_beat.clamp(0.0, (fixed_beat - MIN_CLIP_LENGTH).max(0.0));
+                        clip.start_beat = start;
+                        clip.length_beats =
+                            clamp_clip_length(fixed_beat - start, start, grid_beats);
+                    }
+                    ResizeEdge::End => {
+                        clip.start_beat = fixed_beat;
+                        clip.length_beats =
+                            clamp_clip_length(edge_beat - fixed_beat, fixed_beat, grid_beats);
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_clip_drag(&mut self) {
+        if let Some(drag) = self.clip_drag.take() {
+            if let Some(track) = self.tracks.get_mut(drag.track_index) {
+                sort_clips(&mut track.clips);
+            }
+        }
+    }
+
+    fn create_clip(&mut self, track_index: usize, start_beat: f32) -> usize {
+        let clip_id = self.next_clip_id;
+        self.next_clip_id += 1;
+        let clip = PlaylistClipData {
+            id: clip_id,
+            label: default_clip_label(&self.tracks[track_index]),
+            start_beat,
+            length_beats: MIN_CLIP_LENGTH,
+            muted: false,
+        };
+        self.tracks[track_index].clips.push(clip);
+        clip_id
+    }
+
+    fn split_clip(&mut self, track_index: usize, clip_id: usize, split_beat: f32) {
+        let Some(track) = self.tracks.get_mut(track_index) else {
+            return;
+        };
+        let Some(index) = track.clips.iter().position(|clip| clip.id == clip_id) else {
+            return;
+        };
+
+        let clip = track.clips[index].clone();
+        let clip_end = clip.start_beat + clip.length_beats;
+        if split_beat <= clip.start_beat + MIN_CLIP_LENGTH
+            || split_beat >= clip_end - MIN_CLIP_LENGTH
+        {
+            return;
+        }
+
+        track.clips[index].length_beats = split_beat - clip.start_beat;
+        let new_clip_id = self.next_clip_id;
+        self.next_clip_id += 1;
+        let mut split_clip = clip;
+        split_clip.id = new_clip_id;
+        split_clip.start_beat = split_beat;
+        split_clip.length_beats = clip_end - split_beat;
+        track.clips.push(split_clip);
+        sort_clips(&mut track.clips);
+        self.selected_clip = Some(ClipSelection {
+            track_index,
+            clip_id: new_clip_id,
+        });
+    }
+
+    fn duplicate_clip(&mut self, track_index: usize, clip_id: usize) -> Option<ClipSelection> {
+        let source_clip = self.clip(track_index, clip_id)?.clone();
+        let new_clip_id = self.next_clip_id;
+        self.next_clip_id += 1;
+
+        let mut duplicate = source_clip;
+        duplicate.id = new_clip_id;
+        duplicate.start_beat += duplicate.length_beats;
+
+        let track = self.tracks.get_mut(track_index)?;
+        track.clips.push(duplicate);
+        sort_clips(&mut track.clips);
+
+        Some(ClipSelection {
+            track_index,
+            clip_id: new_clip_id,
+        })
+    }
+
+    fn toggle_clip_mute(&mut self, track_index: usize, clip_id: usize) {
+        if let Some(clip) = self.clip_mut(track_index, clip_id) {
+            clip.muted = !clip.muted;
+        }
+    }
+
+    fn remove_clip(&mut self, track_index: usize, clip_id: usize) {
+        let Some(track) = self.tracks.get_mut(track_index) else {
+            return;
+        };
+        let Some(index) = track.clips.iter().position(|clip| clip.id == clip_id) else {
+            return;
+        };
+        track.clips.remove(index);
+
+        if self.selected_clip.is_some_and(|selection| {
+            selection.track_index == track_index && selection.clip_id == clip_id
+        }) {
+            self.selected_clip = None;
+        }
+        if self
+            .clip_drag
+            .is_some_and(|drag| drag.track_index == track_index && drag.clip_id == clip_id)
+        {
+            self.clip_drag = None;
+        }
+    }
+
+    fn clip(&self, track_index: usize, clip_id: usize) -> Option<&PlaylistClipData> {
+        self.tracks
+            .get(track_index)?
+            .clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+    }
+
+    fn clip_mut(&mut self, track_index: usize, clip_id: usize) -> Option<&mut PlaylistClipData> {
+        self.tracks
+            .get_mut(track_index)?
+            .clips
+            .iter_mut()
+            .find(|clip| clip.id == clip_id)
+    }
+
+    fn selected_clip_summary(&self) -> Option<String> {
+        let selection = self.selected_clip?;
+        let clip = self.clip(selection.track_index, selection.clip_id)?;
+        let bars = clip.length_beats / 4.0;
+        Some(if clip.muted {
+            format!("{} · {:.1} bars · Muted", clip.label, bars)
+        } else {
+            format!("{} · {:.1} bars", clip.label, bars)
+        })
     }
 }
 
@@ -206,45 +688,63 @@ impl Default for PlaylistView {
     }
 }
 
+#[derive(Clone, Debug)]
 struct PlaylistTrack {
-    name: &'static str,
-    lane_label: &'static str,
+    name: String,
+    lane_label: String,
     kind: TrackKind,
     notes: Vec<PianoRollNoteData>,
+    clips: Vec<PlaylistClipData>,
 }
 
 impl PlaylistTrack {
     fn piano_roll(
-        name: &'static str,
-        lane_label: &'static str,
+        name: impl Into<String>,
+        lane_label: impl Into<String>,
         notes: Vec<PianoRollNoteData>,
+        clips: Vec<PlaylistClipData>,
     ) -> Self {
         Self {
-            name,
-            lane_label,
+            name: name.into(),
+            lane_label: lane_label.into(),
             kind: TrackKind::PianoRoll,
             notes,
+            clips,
         }
     }
 
-    fn audio(name: &'static str, lane_label: &'static str) -> Self {
+    fn audio(
+        name: impl Into<String>,
+        lane_label: impl Into<String>,
+        clips: Vec<PlaylistClipData>,
+    ) -> Self {
         Self {
-            name,
-            lane_label,
+            name: name.into(),
+            lane_label: lane_label.into(),
             kind: TrackKind::Audio,
             notes: Vec::new(),
+            clips,
         }
     }
 
     fn snapshot(&self, track_index: usize) -> PianoRollTrackSnapshot {
         PianoRollTrackSnapshot {
             track_index,
-            name: self.name.to_owned(),
-            lane_label: self.lane_label.to_owned(),
+            name: self.name.clone(),
+            lane_label: self.lane_label.clone(),
             kind: self.kind,
             notes: self.notes.clone(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct PlaylistClipData {
+    id: usize,
+    label: String,
+    start_beat: f32,
+    length_beats: f32,
+    muted: bool,
 }
 
 fn sample_tracks() -> Vec<PlaylistTrack> {
@@ -260,6 +760,11 @@ fn sample_tracks() -> Vec<PlaylistTrack> {
                 note(10, 4.5, 0.5, 0.74),
                 note(12, 6.0, 0.5, 0.82),
             ],
+            vec![
+                clip(0, "Kick Loop", 0.0, 4.0),
+                clip(1, "Fill", 6.0, 2.0),
+                clip(2, "Drop", 8.0, 4.0),
+            ],
         ),
         PlaylistTrack::piano_roll(
             "Bass",
@@ -271,6 +776,7 @@ fn sample_tracks() -> Vec<PlaylistTrack> {
                 note(10, 5.0, 1.0, 0.81),
                 note(6, 6.5, 1.0, 0.76),
             ],
+            vec![clip(3, "Bassline", 0.0, 8.0), clip(4, "Pickup", 9.0, 3.0)],
         ),
         PlaylistTrack::piano_roll(
             "Keys",
@@ -286,6 +792,10 @@ fn sample_tracks() -> Vec<PlaylistTrack> {
                 note(7, 4.0, 2.0, 0.69),
                 note(5, 4.0, 2.0, 0.65),
             ],
+            vec![
+                clip(5, "Pads", 2.0, 6.0),
+                clip(6, "Bridge Chords", 10.0, 2.0),
+            ],
         ),
         PlaylistTrack::piano_roll(
             "Lead",
@@ -298,8 +808,16 @@ fn sample_tracks() -> Vec<PlaylistTrack> {
                 note(9, 5.0, 0.75, 0.89),
                 note(11, 6.0, 1.25, 0.94),
             ],
+            vec![clip(7, "Hook", 4.0, 4.0), clip(8, "Answer", 9.0, 2.0)],
         ),
-        PlaylistTrack::audio("Vox", "Audio lane"),
+        PlaylistTrack::audio(
+            "Vox",
+            "Audio lane",
+            vec![
+                clip(9, "Verse Vox", 1.0, 3.0),
+                clip(10, "Chorus Vox", 8.0, 4.0),
+            ],
+        ),
     ]
 }
 
@@ -309,6 +827,23 @@ fn note(lane: usize, start_beat: f32, length_beats: f32, velocity: f32) -> Piano
         start_beat,
         length_beats,
         velocity,
+    }
+}
+
+fn clip(id: usize, label: &str, start_beat: f32, length_beats: f32) -> PlaylistClipData {
+    PlaylistClipData {
+        id,
+        label: label.to_owned(),
+        start_beat,
+        length_beats,
+        muted: false,
+    }
+}
+
+fn default_clip_label(track: &PlaylistTrack) -> String {
+    match track.kind {
+        TrackKind::PianoRoll => format!("{} Pattern", track.name),
+        TrackKind::Audio => format!("{} Audio", track.name),
     }
 }
 
@@ -339,171 +874,82 @@ impl PlaylistTool {
             Self::Mute => "Mute",
         }
     }
+
+    const fn icon(self) -> ToolIcon {
+        match self {
+            Self::Select => ToolIcon::Select,
+            Self::Draw => ToolIcon::Draw,
+            Self::Split => ToolIcon::Split,
+            Self::Duplicate => ToolIcon::Duplicate,
+            Self::Mute => ToolIcon::Mute,
+        }
+    }
 }
 
-fn tool_button(ui: &mut egui::Ui, tool: PlaylistTool, active: bool) -> egui::Response {
-    let size = egui::vec2(28.0, 24.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let painter = ui.painter();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolIcon {
+    Select,
+    Draw,
+    Split,
+    Duplicate,
+    Mute,
+}
 
-    let fill = if active {
-        theme::TOOL_ACTIVE_WASH
-    } else {
-        egui::Color32::TRANSPARENT
-    };
+fn tool_button(
+    ui: &mut egui::Ui,
+    icon: ToolIcon,
+    label: &str,
+    active: bool,
+    enabled: bool,
+) -> egui::Response {
+    let mut style = ui.style().as_ref().clone();
+    style.visuals.widgets.noninteractive.fg_stroke.color = theme::GRID_MAJOR;
+    style.visuals.widgets.inactive.fg_stroke.color = theme::TEXT;
+    style.visuals.widgets.hovered.fg_stroke.color = theme::ACCENT;
+    style.visuals.widgets.active.fg_stroke.color = theme::ACCENT;
+    style.visuals.widgets.open.fg_stroke.color = theme::ACCENT;
+    style.visuals.selection.stroke.color = theme::ACCENT;
 
-    let stroke_color = if active {
-        theme::ACCENT
-    } else if response.hovered() {
-        theme::ACCENT_HOVER
-    } else {
-        theme::TEXT_MUTED
-    };
-
-    if fill != egui::Color32::TRANSPARENT {
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
-    }
-
-    let icon_rect = rect.shrink2(egui::vec2(6.0, 5.0));
-    let icon_stroke = egui::Stroke::new(
-        1.6,
-        if active {
-            theme::ACCENT_HOVER
-        } else if response.hovered() {
-            theme::TEXT
+    let image = egui::Image::new(icon_source(icon))
+        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+        .tint(egui::Color32::WHITE);
+    let button = egui::Button::image(image)
+        .min_size(egui::vec2(28.0, 24.0))
+        .fill(if active {
+            theme::TOOL_ACTIVE_WASH
         } else {
-            theme::TEXT_MUTED
-        },
-    );
-    paint_tool_icon(painter, icon_rect, tool, icon_stroke);
-
-    if active {
-        painter.line_segment(
-            [
-                egui::pos2(rect.left(), rect.bottom()),
-                egui::pos2(rect.right(), rect.bottom()),
-            ],
-            egui::Stroke::new(2.0, stroke_color),
-        );
-    }
-
-    response.on_hover_text(tool.label())
+            theme::SURFACE_0
+        })
+        .stroke(egui::Stroke::new(
+            1.0,
+            if active {
+                theme::ACCENT
+            } else if enabled {
+                theme::BORDER
+            } else {
+                theme::GRID_ROW
+            },
+        ))
+        .corner_radius(3.0)
+        .image_tint_follows_text_color(true);
+    ui.scope(|ui| {
+        ui.set_style(style);
+        ui.add_enabled(enabled, button)
+    })
+    .inner
+    .on_hover_text(label)
 }
 
-fn paint_tool_icon(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    tool: PlaylistTool,
-    stroke: egui::Stroke,
-) {
-    match tool {
-        PlaylistTool::Select => {
-            let points = vec![
-                egui::pos2(rect.left(), rect.top()),
-                egui::pos2(rect.left() + rect.width() * 0.68, rect.center().y),
-                egui::pos2(rect.center().x, rect.center().y),
-                egui::pos2(rect.right(), rect.bottom()),
-                egui::pos2(rect.center().x + 1.0, rect.bottom()),
-                egui::pos2(rect.left(), rect.top()),
-            ];
-            painter.add(egui::Shape::line(points, stroke));
-        }
-        PlaylistTool::Draw => {
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left(), rect.bottom()),
-                    egui::pos2(rect.right(), rect.top()),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.right() - 3.0, rect.top() + 1.0),
-                    egui::pos2(rect.right(), rect.top() + 4.0),
-                ],
-                stroke,
-            );
-        }
-        PlaylistTool::Split => {
-            let x = rect.center().x;
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left(), rect.top() + 3.0),
-                    egui::pos2(x - 2.0, rect.center().y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left(), rect.bottom() - 3.0),
-                    egui::pos2(x - 2.0, rect.center().y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.right(), rect.top() + 3.0),
-                    egui::pos2(x + 2.0, rect.center().y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.right(), rect.bottom() - 3.0),
-                    egui::pos2(x + 2.0, rect.center().y),
-                ],
-                stroke,
-            );
-        }
-        PlaylistTool::Duplicate => {
-            let back = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + 1.0, rect.top() + 3.0),
-                egui::pos2(rect.right() - 4.0, rect.bottom() - 1.0),
-            );
-            let front = back.translate(egui::vec2(4.0, -3.0));
-            painter.rect_stroke(
-                back,
-                egui::CornerRadius::ZERO,
-                stroke,
-                egui::StrokeKind::Outside,
-            );
-            painter.rect_stroke(
-                front,
-                egui::CornerRadius::ZERO,
-                stroke,
-                egui::StrokeKind::Outside,
-            );
-        }
-        PlaylistTool::Mute => {
-            let speaker = vec![
-                egui::pos2(rect.left(), rect.center().y - 2.0),
-                egui::pos2(rect.left() + 3.0, rect.center().y - 2.0),
-                egui::pos2(rect.left() + 6.0, rect.top() + 1.0),
-                egui::pos2(rect.left() + 6.0, rect.bottom() - 1.0),
-                egui::pos2(rect.left() + 3.0, rect.center().y + 2.0),
-                egui::pos2(rect.left(), rect.center().y + 2.0),
-            ];
-            painter.add(egui::Shape::closed_line(speaker, stroke));
-            painter.line_segment(
-                [
-                    egui::pos2(rect.center().x + 1.0, rect.top() + 2.0),
-                    egui::pos2(rect.right(), rect.bottom() - 2.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.right(), rect.top() + 2.0),
-                    egui::pos2(rect.center().x + 1.0, rect.bottom() - 2.0),
-                ],
-                stroke,
-            );
-        }
-    }
+fn status_chip(ui: &mut egui::Ui, label: &str) {
+    let text = egui::RichText::new(label)
+        .size(10.5)
+        .color(theme::TEXT_MUTED);
+    let button = egui::Button::new(text)
+        .min_size(egui::vec2(0.0, 24.0))
+        .fill(theme::SURFACE_0)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(3.0);
+    ui.add(button);
 }
 
 fn draw_timeline(painter: &egui::Painter, rect: egui::Rect, offset_x: f32) {
@@ -527,7 +973,7 @@ fn draw_timeline(painter: &egui::Painter, rect: egui::Rect, offset_x: f32) {
 fn draw_grid(painter: &egui::Painter, rect: egui::Rect, track_count: usize) {
     let bars = (rect.width() / BAR_WIDTH).ceil().max(1.0) as usize;
     for index in 0..=bars * 4 {
-        let x = rect.left() + index as f32 * (BAR_WIDTH / 4.0);
+        let x = rect.left() + index as f32 * BEAT_WIDTH;
         let stroke = if index % 4 == 0 {
             egui::Stroke::new(1.0, theme::GRID_MAJOR)
         } else {
@@ -549,12 +995,12 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect, track_count: usize) {
 }
 
 fn draw_tracks(
-    ui: &mut egui::Ui,
     painter: &egui::Painter,
     sidebar_rect: egui::Rect,
     grid_rect: egui::Rect,
     tracks: &[PlaylistTrack],
-    selected_track: &mut usize,
+    selected_track: usize,
+    selected_clip: Option<ClipSelection>,
 ) {
     for (index, track) in tracks.iter().enumerate() {
         let top = sidebar_rect.top() + index as f32 * (TRACK_HEIGHT + TRACK_GAP);
@@ -562,29 +1008,13 @@ fn draw_tracks(
             egui::pos2(sidebar_rect.left(), top),
             egui::pos2(sidebar_rect.right(), top + TRACK_HEIGHT),
         );
-        let clip_rect = egui::Rect::from_min_max(
-            egui::pos2(grid_rect.left() + 20.0 + index as f32 * 38.0, top + 14.0),
-            egui::pos2(grid_rect.left() + 216.0 + index as f32 * 44.0, top + 56.0),
+        let track_lane_rect = egui::Rect::from_min_max(
+            egui::pos2(grid_rect.left(), top),
+            egui::pos2(grid_rect.right(), top + TRACK_HEIGHT),
         );
-        let clip_rect = egui::Rect::from_min_max(
-            clip_rect.min,
-            egui::pos2(
-                clip_rect.max.x.min(grid_rect.right() - 12.0),
-                clip_rect.max.y,
-            ),
-        );
+        let is_selected_track = selected_track == index;
 
-        let row_response = ui.interact(
-            track_rect.union(clip_rect),
-            ui.make_persistent_id(("playlist_track", index)),
-            egui::Sense::click(),
-        );
-        if row_response.clicked() {
-            *selected_track = index;
-        }
-
-        let is_selected = *selected_track == index;
-        let track_fill = if is_selected {
+        let track_fill = if is_selected_track {
             theme::TOOL_ACTIVE_WASH
         } else if index % 2 == 0 {
             theme::SURFACE_1
@@ -593,7 +1023,17 @@ fn draw_tracks(
         };
 
         painter.rect_filled(track_rect, egui::CornerRadius::ZERO, track_fill);
-        if is_selected {
+        if is_selected_track {
+            painter.rect_filled(
+                track_lane_rect,
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_rgba_unmultiplied(
+                    theme::ACCENT.r(),
+                    theme::ACCENT.g(),
+                    theme::ACCENT.b(),
+                    12,
+                ),
+            );
             painter.line_segment(
                 [
                     egui::pos2(track_rect.left(), track_rect.top()),
@@ -602,45 +1042,224 @@ fn draw_tracks(
                 egui::Stroke::new(2.0, theme::ACCENT),
             );
         }
+
         painter.text(
             egui::pos2(track_rect.left() + 14.0, track_rect.top() + 18.0),
             egui::Align2::LEFT_CENTER,
-            track.name,
+            track.name.as_str(),
             egui::FontId::proportional(13.0),
             theme::TEXT,
         );
         painter.text(
             egui::pos2(track_rect.left() + 14.0, track_rect.top() + 40.0),
             egui::Align2::LEFT_CENTER,
-            track.lane_label,
+            track.lane_label.as_str(),
             egui::FontId::proportional(11.0),
             theme::TEXT_MUTED,
         );
 
-        if clip_rect.width() > 6.0 {
-            let clip_fill = if is_selected {
-                egui::Color32::from_rgba_unmultiplied(111, 184, 255, 56)
-            } else if track.kind == TrackKind::Audio {
-                egui::Color32::from_rgba_unmultiplied(196, 202, 214, 32)
+        let kind_tag = match track.kind {
+            TrackKind::PianoRoll => "MIDI",
+            TrackKind::Audio => "AUDIO",
+        };
+        painter.text(
+            egui::pos2(track_rect.right() - 14.0, track_rect.top() + 18.0),
+            egui::Align2::RIGHT_CENTER,
+            kind_tag,
+            egui::FontId::proportional(10.5),
+            if track.kind == TrackKind::PianoRoll {
+                theme::ACCENT_HOVER
             } else {
-                theme::accent_soft()
-            };
-            painter.rect_filled(clip_rect, egui::CornerRadius::ZERO, clip_fill);
+                theme::TEXT_MUTED
+            },
+        );
+
+        for clip in &track.clips {
+            let clip_rect = clip_rect(grid_rect, index, clip);
+            if clip_rect.width() <= 6.0 {
+                continue;
+            }
+
+            let is_selected_clip = selected_clip.is_some_and(|selection| {
+                selection.track_index == index && selection.clip_id == clip.id
+            });
+
+            let (fill, stroke, text_color) = clip_palette(track.kind, clip.muted, is_selected_clip);
+            painter.rect_filled(clip_rect, 4.0, fill);
             painter.rect_stroke(
                 clip_rect,
-                egui::CornerRadius::ZERO,
-                egui::Stroke::new(
-                    if is_selected { 1.5 } else { 1.0 },
-                    if is_selected {
-                        theme::ACCENT_HOVER
-                    } else if track.kind == TrackKind::Audio {
-                        theme::TEXT_MUTED
-                    } else {
-                        theme::ACCENT
-                    },
-                ),
-                egui::StrokeKind::Outside,
+                4.0,
+                egui::Stroke::new(if is_selected_clip { 1.5 } else { 1.0 }, stroke),
+                egui::StrokeKind::Inside,
             );
+
+            let handle_stroke = egui::Stroke::new(1.0, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(clip_rect.left() + 7.0, clip_rect.top() + 7.0),
+                    egui::pos2(clip_rect.left() + 7.0, clip_rect.bottom() - 7.0),
+                ],
+                handle_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(clip_rect.right() - 7.0, clip_rect.top() + 7.0),
+                    egui::pos2(clip_rect.right() - 7.0, clip_rect.bottom() - 7.0),
+                ],
+                handle_stroke,
+            );
+
+            if clip_rect.width() > 44.0 {
+                painter.text(
+                    egui::pos2(clip_rect.left() + 14.0, clip_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    clip.label.as_str(),
+                    egui::FontId::proportional(11.5),
+                    text_color,
+                );
+            }
+            if clip.muted && clip_rect.width() > 60.0 {
+                painter.text(
+                    egui::pos2(clip_rect.right() - 10.0, clip_rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    "M",
+                    egui::FontId::proportional(11.0),
+                    theme::TEXT_MUTED,
+                );
+            }
         }
     }
+}
+
+fn clip_palette(
+    track_kind: TrackKind,
+    muted: bool,
+    selected: bool,
+) -> (egui::Color32, egui::Color32, egui::Color32) {
+    if muted {
+        return (
+            egui::Color32::from_rgba_unmultiplied(150, 154, 162, 42),
+            egui::Color32::from_rgb(128, 133, 141),
+            theme::TEXT_MUTED,
+        );
+    }
+
+    match (track_kind, selected) {
+        (TrackKind::PianoRoll, true) => (
+            egui::Color32::from_rgba_unmultiplied(111, 184, 255, 72),
+            theme::ACCENT_HOVER,
+            theme::TEXT,
+        ),
+        (TrackKind::PianoRoll, false) => (theme::accent_soft(), theme::ACCENT, theme::TEXT),
+        (TrackKind::Audio, true) => (
+            egui::Color32::from_rgba_unmultiplied(196, 202, 214, 60),
+            egui::Color32::from_rgb(218, 224, 235),
+            theme::TEXT,
+        ),
+        (TrackKind::Audio, false) => (
+            egui::Color32::from_rgba_unmultiplied(196, 202, 214, 28),
+            theme::TEXT_MUTED,
+            theme::TEXT_MUTED,
+        ),
+    }
+}
+
+fn icon_source(icon: ToolIcon) -> egui::ImageSource<'static> {
+    match icon {
+        ToolIcon::Select => egui::include_image!("../assets/piano_roll_tools/select.svg"),
+        ToolIcon::Draw => egui::include_image!("../assets/piano_roll_tools/draw.svg"),
+        ToolIcon::Split => egui::include_image!("../assets/piano_roll_tools/split.svg"),
+        ToolIcon::Duplicate => egui::include_image!("../assets/piano_roll_tools/duplicate.svg"),
+        ToolIcon::Mute => egui::include_image!("../assets/piano_roll_tools/mute.svg"),
+    }
+}
+
+fn clip_hit_test(rect: egui::Rect, tracks: &[PlaylistTrack], pos: egui::Pos2) -> Option<ClipHit> {
+    for (track_index, track) in tracks.iter().enumerate().rev() {
+        for clip in track.clips.iter().rev() {
+            let clip_rect = clip_rect(rect, track_index, clip);
+            if !clip_rect.contains(pos) {
+                continue;
+            }
+
+            let handle_width = RESIZE_HANDLE_WIDTH.min(clip_rect.width() * 0.5);
+            let edge = if pos.x <= clip_rect.left() + handle_width {
+                Some(ResizeEdge::Start)
+            } else if pos.x >= clip_rect.right() - handle_width {
+                Some(ResizeEdge::End)
+            } else {
+                None
+            };
+            return Some(ClipHit {
+                track_index,
+                clip_id: clip.id,
+                edge,
+            });
+        }
+    }
+
+    None
+}
+
+fn clip_rect(rect: egui::Rect, track_index: usize, clip: &PlaylistClipData) -> egui::Rect {
+    let top = rect.top() + track_index as f32 * (TRACK_HEIGHT + TRACK_GAP) + CLIP_VERTICAL_PADDING;
+    let bottom = (top + TRACK_HEIGHT - CLIP_VERTICAL_PADDING * 2.0).min(rect.bottom() - 2.0);
+    let left = rect.left() + clip.start_beat * BEAT_WIDTH;
+    let right = (left + clip.length_beats * BEAT_WIDTH).min(rect.right() - 3.0);
+    egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
+}
+
+fn pos_to_track(rect: egui::Rect, pos: egui::Pos2, track_count: usize) -> Option<usize> {
+    let local_y = pos.y - rect.top();
+    if local_y < 0.0 {
+        return None;
+    }
+
+    let stride = TRACK_HEIGHT + TRACK_GAP;
+    let track_index = (local_y / stride).floor() as usize;
+    if track_index >= track_count {
+        return None;
+    }
+
+    let track_top = rect.top() + track_index as f32 * stride;
+    if pos.y <= track_top + TRACK_HEIGHT {
+        Some(track_index)
+    } else {
+        None
+    }
+}
+
+fn pos_to_beat(rect: egui::Rect, pos: egui::Pos2) -> f32 {
+    ((pos.x - rect.left()) / BEAT_WIDTH).clamp(0.0, grid_total_beats(rect))
+}
+
+fn grid_total_beats(rect: egui::Rect) -> f32 {
+    (rect.width() / BEAT_WIDTH).max(MIN_CLIP_LENGTH)
+}
+
+fn quantize_beat(beat: f32, free_drag: bool) -> f32 {
+    if free_drag {
+        beat.max(0.0)
+    } else {
+        (beat / SNAP_BEATS).round() * SNAP_BEATS
+    }
+}
+
+fn clamp_start_beat(start: f32, length: f32, grid_beats: f32) -> f32 {
+    start.clamp(0.0, (grid_beats - length.max(MIN_CLIP_LENGTH)).max(0.0))
+}
+
+fn clamp_clip_length(length: f32, start: f32, grid_beats: f32) -> f32 {
+    length
+        .max(MIN_CLIP_LENGTH)
+        .min((grid_beats - start).max(MIN_CLIP_LENGTH))
+}
+
+fn sort_clips(clips: &mut [PlaylistClipData]) {
+    clips.sort_by(|left, right| {
+        left.start_beat
+            .total_cmp(&right.start_beat)
+            .then(left.length_beats.total_cmp(&right.length_beats))
+            .then(left.id.cmp(&right.id))
+    });
 }

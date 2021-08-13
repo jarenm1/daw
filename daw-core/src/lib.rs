@@ -1,10 +1,10 @@
 //! Core data models for the DAW
-//! 
+//!
 //! This crate contains pure data structures and operations for:
 //! - Projects (patterns, channels, playlist)
 //! - Timeline operations
 //! - Serialization/deserialization
-//! 
+//!
 //! No UI or audio dependencies - completely headless.
 
 pub mod channel;
