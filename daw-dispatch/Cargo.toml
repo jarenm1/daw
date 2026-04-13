@@ -1,0 +1,15 @@
+[package]
+name = "daw_dispatch"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+daw_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

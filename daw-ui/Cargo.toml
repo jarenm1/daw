@@ -1,0 +1,13 @@
+[package]
+name = "daw_ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+egui_extras = { version = "0.33.3", features = ["svg"] }
+
+[lints]
+workspace = true

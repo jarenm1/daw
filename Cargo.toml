@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+default-members = ["daw"]
+members = [
+    "daw_audio_engine",
+    "daw-core",
+    "daw-dispatch",
+    "daw-ui",
+    "daw",
+]
+
+[workspace.package]
+publish = false
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+daw_audio_engine = { path = "./daw_audio_engine" }
+daw_core = { path = "./daw-core" }
+daw_dispatch = { path = "./daw-dispatch" }
+daw_ui = { path = "./daw-ui" }
+eframe = "0.33.3"
+egui = "0.33.3"
+quote = "1.0.45"
+syn = "2.0.117"
+proc-macro2 = "1.0.106"
+parking_lot = "0.12.5"
+pollster = "0.4.0"
+anyhow = "1.0.102"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+regex = "1"
+
+[workspace.lints.rust]
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+
+[profile.dev]
+opt-level = 2
+
+[profile.dist]
+inherits = "release"
+lto = true
+strip = "symbols"
