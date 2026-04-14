@@ -45,6 +45,7 @@ pub struct PlaylistView {
     selected_track: usize,
     selected_clip: Option<ClipSelection>,
     clip_drag: Option<ClipDrag>,
+    timeline_scrubbing: bool,
     next_clip_id: usize,
     viewport: PlaylistViewport,
     tracks: Vec<PlaylistTrack>,
@@ -111,6 +112,7 @@ impl PlaylistView {
             selected_track: 0,
             selected_clip: None,
             clip_drag: None,
+            timeline_scrubbing: false,
             next_clip_id,
             viewport: PlaylistViewport::new(),
             tracks,
@@ -154,16 +156,21 @@ impl PlaylistView {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, interactions_enabled: bool) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        interactions_enabled: bool,
+        playhead_beats: f32,
+    ) -> Option<f32> {
         let rect = ui.max_rect();
         let frame = egui::Frame::default()
             .fill(theme::SURFACE_0)
             .corner_radius(egui::CornerRadius::ZERO)
             .inner_margin(egui::Margin::ZERO);
 
-        frame.show(ui, |ui| {
+        let output = frame.show(ui, |ui| {
             self.show_toolbar(ui);
-            self.show_body(ui, interactions_enabled);
+            self.show_body(ui, interactions_enabled, playhead_beats)
         });
 
         let stroke = egui::Stroke::new(1.0, theme::BORDER);
@@ -171,6 +178,8 @@ impl PlaylistView {
         painter.line_segment([rect.left_top(), rect.left_bottom()], stroke);
         painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
         painter.line_segment([rect.left_bottom(), rect.right_bottom()], stroke);
+
+        output.inner
     }
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -240,7 +249,12 @@ impl PlaylistView {
         });
     }
 
-    fn show_body(&mut self, ui: &mut egui::Ui, interactions_enabled: bool) {
+    fn show_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        interactions_enabled: bool,
+        playhead_beats: f32,
+    ) -> Option<f32> {
         let available = ui.available_size_before_wrap();
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let painter = ui.painter().clone();
@@ -270,6 +284,13 @@ impl PlaylistView {
             content_height,
         );
 
+        let seek_to_beat = if interactions_enabled {
+            self.handle_timeline_seek(ui, timeline_rect)
+        } else {
+            self.timeline_scrubbing = false;
+            None
+        };
+
         if interactions_enabled {
             self.handle_clip_interactions(ui, sidebar_rect, grid_rect, self.viewport);
         }
@@ -294,7 +315,13 @@ impl PlaylistView {
         let sidebar_painter = painter.with_clip_rect(sidebar_rect);
         let grid_painter = painter.with_clip_rect(grid_rect);
 
-        draw_timeline(&painter, timeline_rect, TRACK_HEADER_WIDTH, self.viewport);
+        draw_timeline(
+            &painter,
+            timeline_rect,
+            TRACK_HEADER_WIDTH,
+            self.viewport,
+            playhead_beats,
+        );
         draw_grid(&grid_painter, grid_rect, self.tracks.len(), self.viewport);
         draw_tracks(
             &sidebar_painter,
@@ -306,6 +333,52 @@ impl PlaylistView {
             self.selected_clip,
             self.viewport,
         );
+
+        draw_playhead(
+            &painter,
+            timeline_rect,
+            grid_rect,
+            playhead_beats,
+            self.viewport,
+        );
+
+        seek_to_beat
+    }
+
+    fn handle_timeline_seek(&mut self, ui: &egui::Ui, timeline_rect: egui::Rect) -> Option<f32> {
+        let pointer_pos = ui.input(|input| input.pointer.interact_pos());
+        let primary_pressed =
+            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+        let primary_down =
+            ui.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+        let timeline_grid_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                timeline_rect.left() + TRACK_HEADER_WIDTH,
+                timeline_rect.top(),
+            ),
+            timeline_rect.max,
+        );
+
+        if primary_pressed {
+            self.timeline_scrubbing =
+                pointer_pos.is_some_and(|pos| timeline_grid_rect.contains(pos));
+        }
+
+        if !primary_down {
+            self.timeline_scrubbing = false;
+            return None;
+        }
+        if !self.timeline_scrubbing {
+            return None;
+        }
+
+        let pos = pointer_pos?;
+        let clamped_pos = egui::pos2(
+            pos.x
+                .clamp(timeline_grid_rect.left(), timeline_grid_rect.right()),
+            pos.y,
+        );
+        Some(pos_to_beat(timeline_grid_rect, clamped_pos, self.viewport))
     }
 
     fn handle_clip_interactions(
@@ -1052,6 +1125,7 @@ fn draw_timeline(
     rect: egui::Rect,
     offset_x: f32,
     viewport: PlaylistViewport,
+    playhead_beats: f32,
 ) {
     let grid_width = (rect.width() - offset_x).max(1.0);
     let beat_width = grid_width / grid_total_beats(viewport);
@@ -1068,6 +1142,14 @@ fn draw_timeline(
             format!("{:02}", index + 1),
             egui::FontId::proportional(12.0),
             theme::TEXT_MUTED,
+        );
+    }
+
+    if let Some(playhead_x) = playhead_x(rect, offset_x, playhead_beats, viewport) {
+        painter.circle_filled(
+            egui::pos2(playhead_x, rect.center().y),
+            3.0,
+            theme::ACCENT_HOVER,
         );
     }
 }
@@ -1376,6 +1458,54 @@ fn playlist_content_height(track_count: usize) -> f32 {
     } else {
         track_count as f32 * TRACK_HEIGHT + (track_count - 1) as f32 * TRACK_GAP
     }
+}
+
+fn draw_playhead(
+    painter: &egui::Painter,
+    timeline_rect: egui::Rect,
+    grid_rect: egui::Rect,
+    playhead_beats: f32,
+    viewport: PlaylistViewport,
+) {
+    let Some(x) = playhead_x(timeline_rect, TRACK_HEADER_WIDTH, playhead_beats, viewport) else {
+        return;
+    };
+    if x < grid_rect.left() || x > grid_rect.right() {
+        return;
+    }
+
+    let stroke = egui::Stroke::new(1.5, theme::ACCENT_HOVER);
+    painter.line_segment(
+        [
+            egui::pos2(x, timeline_rect.top()),
+            egui::pos2(x, grid_rect.bottom()),
+        ],
+        stroke,
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x, timeline_rect.top() + 3.0),
+            egui::pos2(x - 5.0, timeline_rect.top() + 11.0),
+            egui::pos2(x + 5.0, timeline_rect.top() + 11.0),
+        ],
+        theme::ACCENT_HOVER,
+        egui::Stroke::NONE,
+    ));
+}
+
+fn playhead_x(
+    rect: egui::Rect,
+    offset_x: f32,
+    playhead_beats: f32,
+    viewport: PlaylistViewport,
+) -> Option<f32> {
+    let visible_beats = grid_total_beats(viewport);
+    if playhead_beats < 0.0 || playhead_beats > visible_beats {
+        return None;
+    }
+
+    let grid_width = (rect.width() - offset_x).max(1.0);
+    Some(rect.left() + offset_x + playhead_beats * (grid_width / visible_beats))
 }
 
 fn zoom_visible_bars(current: f32, scroll_y: f32) -> f32 {

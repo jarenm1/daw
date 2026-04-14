@@ -9,6 +9,7 @@ use crate::{
 
 const HEADER_HEIGHT: f32 = 38.0;
 const TOOLBAR_HEIGHT: f32 = 38.0;
+const TIMELINE_HEIGHT: f32 = 28.0;
 const KEYBOARD_WIDTH: f32 = 88.0;
 const ROW_HEIGHT: f32 = 22.0;
 const SNAP_BEATS: f32 = 0.25;
@@ -23,11 +24,17 @@ const MAX_VISIBLE_BARS: f32 = 32.0;
 const SCROLL_SENSITIVITY: f32 = 0.7;
 const ZOOM_SENSITIVITY: f32 = 0.01;
 
+pub struct PianoRollWindowOutput {
+    pub blocks_pointer: bool,
+    pub seek_to_beat: Option<f32>,
+}
+
 pub struct PianoRollView {
     active_tool: PianoRollTool,
     ghost_notes_enabled: bool,
     ghost_track_indices: BTreeSet<usize>,
     note_drag: Option<NoteDrag>,
+    timeline_scrubbing: bool,
     viewport: PianoRollViewport,
     scale_highlight: ScaleHighlight,
 }
@@ -105,6 +112,7 @@ impl PianoRollView {
             ghost_notes_enabled: false,
             ghost_track_indices: BTreeSet::new(),
             note_drag: None,
+            timeline_scrubbing: false,
             viewport: PianoRollViewport::new(),
             scale_highlight: ScaleHighlight::default(),
         }
@@ -116,7 +124,8 @@ impl PianoRollView {
         open: &mut bool,
         active_track: &mut PianoRollTrackSnapshot,
         piano_roll_tracks: &[PianoRollTrackSnapshot],
-    ) -> bool {
+        playhead_beats: f32,
+    ) -> PianoRollWindowOutput {
         if self
             .note_drag
             .is_some_and(|drag| drag.track_index != active_track.track_index)
@@ -153,17 +162,23 @@ impl PianoRollView {
                     .stroke(egui::Stroke::new(1.0, theme::BORDER)),
             )
             .show(ctx, |ui| {
-                self.show_contents(ui, active_track, &ghost_candidates);
+                self.show_contents(ui, active_track, &ghost_candidates, playhead_beats)
             });
 
-        window_response.is_some_and(|response| {
+        let blocks_pointer = window_response.as_ref().is_some_and(|response| {
             ctx.input(|input| {
                 input
                     .pointer
                     .hover_pos()
                     .is_some_and(|pos| response.response.rect.contains(pos))
             })
-        })
+        });
+        let seek_to_beat = window_response.and_then(|response| response.inner.flatten());
+
+        PianoRollWindowOutput {
+            blocks_pointer,
+            seek_to_beat,
+        }
     }
 
     fn show_contents(
@@ -171,17 +186,20 @@ impl PianoRollView {
         ui: &mut egui::Ui,
         active_track: &mut PianoRollTrackSnapshot,
         ghost_candidates: &[&PianoRollTrackSnapshot],
-    ) {
+        playhead_beats: f32,
+    ) -> Option<f32> {
         let frame = egui::Frame::default()
             .fill(theme::SURFACE_0)
             .corner_radius(egui::CornerRadius::ZERO)
             .inner_margin(egui::Margin::ZERO);
 
-        frame.show(ui, |ui| {
-            self.show_header(ui, active_track);
-            self.show_toolbar(ui, active_track, ghost_candidates);
-            self.show_body(ui, active_track, ghost_candidates);
-        });
+        frame
+            .show(ui, |ui| {
+                self.show_header(ui, active_track);
+                self.show_toolbar(ui, active_track, ghost_candidates);
+                self.show_body(ui, active_track, ghost_candidates, playhead_beats)
+            })
+            .inner
     }
 
     fn show_header(&self, ui: &mut egui::Ui, active_track: &PianoRollTrackSnapshot) {
@@ -434,32 +452,80 @@ impl PianoRollView {
         ui: &mut egui::Ui,
         active_track: &mut PianoRollTrackSnapshot,
         ghost_candidates: &[&PianoRollTrackSnapshot],
-    ) {
+        playhead_beats: f32,
+    ) -> Option<f32> {
         let available = ui.available_size_before_wrap();
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let painter = ui.painter().clone();
 
         painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::SURFACE_0);
 
+        let timeline_rect =
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TIMELINE_HEIGHT));
+        let editor_rect =
+            egui::Rect::from_min_max(egui::pos2(rect.left(), timeline_rect.bottom()), rect.max);
+        let timeline_keyboard_rect = egui::Rect::from_min_max(
+            timeline_rect.min,
+            egui::pos2(
+                timeline_rect.left() + KEYBOARD_WIDTH,
+                timeline_rect.bottom(),
+            ),
+        );
+        let timeline_grid_rect = egui::Rect::from_min_max(
+            egui::pos2(timeline_keyboard_rect.right(), timeline_rect.top()),
+            timeline_rect.max,
+        );
+
         if active_track.kind != TrackKind::PianoRoll {
             self.note_drag = None;
-            draw_empty_state(&painter, rect, active_track.name.as_str());
-            return;
+            painter.rect_filled(timeline_rect, egui::CornerRadius::ZERO, theme::SURFACE_1);
+            painter.line_segment(
+                [timeline_rect.left_bottom(), timeline_rect.right_bottom()],
+                egui::Stroke::new(1.0, theme::BORDER),
+            );
+            draw_piano_roll_timeline(&painter, timeline_grid_rect, self.viewport, playhead_beats);
+            draw_piano_roll_playhead(
+                &painter,
+                timeline_grid_rect,
+                editor_rect,
+                playhead_beats,
+                self.viewport,
+            );
+            draw_empty_state(&painter, editor_rect, active_track.name.as_str());
+            return self.handle_timeline_seek(ui, timeline_grid_rect);
         }
 
         let keyboard_rect = egui::Rect::from_min_max(
-            rect.min,
-            egui::pos2(rect.left() + KEYBOARD_WIDTH, rect.bottom()),
+            editor_rect.min,
+            egui::pos2(editor_rect.left() + KEYBOARD_WIDTH, editor_rect.bottom()),
         );
-        let grid_rect =
-            egui::Rect::from_min_max(egui::pos2(keyboard_rect.right(), rect.top()), rect.max);
+        let grid_rect = egui::Rect::from_min_max(
+            egui::pos2(keyboard_rect.right(), editor_rect.top()),
+            editor_rect.max,
+        );
         let content_height = NOTE_ROWS as f32 * ROW_HEIGHT;
         self.viewport
-            .apply_input(ui, response.hovered(), rect.height(), content_height);
+            .apply_input(ui, response.hovered(), editor_rect.height(), content_height);
+
+        let seek_to_beat = self.handle_timeline_seek(ui, timeline_grid_rect);
+
+        painter.rect_filled(timeline_rect, egui::CornerRadius::ZERO, theme::SURFACE_1);
+        painter.line_segment(
+            [timeline_rect.left_bottom(), timeline_rect.right_bottom()],
+            egui::Stroke::new(1.0, theme::BORDER),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(timeline_keyboard_rect.right(), timeline_rect.top()),
+                egui::pos2(timeline_keyboard_rect.right(), rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, theme::BORDER),
+        );
 
         let keyboard_painter = painter.with_clip_rect(keyboard_rect);
         let grid_painter = painter.with_clip_rect(grid_rect);
 
+        draw_piano_roll_timeline(&painter, timeline_grid_rect, self.viewport, playhead_beats);
         draw_keyboard(
             &keyboard_painter,
             keyboard_rect,
@@ -489,14 +555,48 @@ impl PianoRollView {
 
         self.handle_note_interactions(ui, grid_rect, active_track, self.viewport);
         draw_active_notes(&grid_painter, grid_rect, &active_track.notes, self.viewport);
-
-        painter.line_segment(
-            [
-                egui::pos2(keyboard_rect.right(), rect.top()),
-                egui::pos2(keyboard_rect.right(), rect.bottom()),
-            ],
-            egui::Stroke::new(1.0, theme::BORDER),
+        draw_piano_roll_playhead(
+            &painter,
+            timeline_grid_rect,
+            grid_rect,
+            playhead_beats,
+            self.viewport,
         );
+
+        seek_to_beat
+    }
+
+    fn handle_timeline_seek(
+        &mut self,
+        ui: &egui::Ui,
+        timeline_grid_rect: egui::Rect,
+    ) -> Option<f32> {
+        let pointer_pos = ui.input(|input| input.pointer.interact_pos());
+        let primary_pressed =
+            ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+        let primary_down =
+            ui.input(|input| input.pointer.button_down(egui::PointerButton::Primary));
+
+        if primary_pressed {
+            self.timeline_scrubbing =
+                pointer_pos.is_some_and(|pos| timeline_grid_rect.contains(pos));
+        }
+
+        if !primary_down {
+            self.timeline_scrubbing = false;
+            return None;
+        }
+        if !self.timeline_scrubbing {
+            return None;
+        }
+
+        let pos = pointer_pos?;
+        let clamped_pos = egui::pos2(
+            pos.x
+                .clamp(timeline_grid_rect.left(), timeline_grid_rect.right()),
+            pos.y,
+        );
+        Some(pos_to_beat(timeline_grid_rect, clamped_pos, self.viewport))
     }
 
     fn handle_note_interactions(
@@ -986,6 +1086,69 @@ fn draw_grid(
     }
 }
 
+fn draw_piano_roll_timeline(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    viewport: PianoRollViewport,
+    playhead_beats: f32,
+) {
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::SURFACE_1);
+
+    let beat_width = beat_width(rect, viewport);
+    let bars = viewport.visible_bars as usize;
+    for index in 0..bars {
+        let x = rect.left() + index as f32 * beat_width * 4.0;
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0, theme::GRID_MAJOR),
+        );
+        painter.text(
+            egui::pos2(x + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{:02}", index + 1),
+            egui::FontId::proportional(12.0),
+            theme::TEXT_MUTED,
+        );
+    }
+
+    if let Some(x) = piano_roll_playhead_x(rect, playhead_beats, viewport) {
+        painter.circle_filled(egui::pos2(x, rect.center().y), 3.0, theme::ACCENT_HOVER);
+    }
+}
+
+fn draw_piano_roll_playhead(
+    painter: &egui::Painter,
+    timeline_rect: egui::Rect,
+    grid_rect: egui::Rect,
+    playhead_beats: f32,
+    viewport: PianoRollViewport,
+) {
+    let Some(x) = piano_roll_playhead_x(timeline_rect, playhead_beats, viewport) else {
+        return;
+    };
+    if x < grid_rect.left() || x > grid_rect.right() {
+        return;
+    }
+
+    let stroke = egui::Stroke::new(1.5, theme::ACCENT_HOVER);
+    painter.line_segment(
+        [
+            egui::pos2(x, timeline_rect.top()),
+            egui::pos2(x, grid_rect.bottom()),
+        ],
+        stroke,
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(x, timeline_rect.top() + 3.0),
+            egui::pos2(x - 5.0, timeline_rect.top() + 11.0),
+            egui::pos2(x + 5.0, timeline_rect.top() + 11.0),
+        ],
+        theme::ACCENT_HOVER,
+        egui::Stroke::NONE,
+    ));
+}
+
 fn draw_ghost_tracks(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -1243,6 +1406,19 @@ fn pos_to_beat(rect: egui::Rect, pos: egui::Pos2, viewport: PianoRollViewport) -
 
 fn beat_width(rect: egui::Rect, viewport: PianoRollViewport) -> f32 {
     rect.width() / grid_total_beats(viewport)
+}
+
+fn piano_roll_playhead_x(
+    rect: egui::Rect,
+    playhead_beats: f32,
+    viewport: PianoRollViewport,
+) -> Option<f32> {
+    let visible_beats = grid_total_beats(viewport);
+    if playhead_beats < 0.0 || playhead_beats > visible_beats {
+        return None;
+    }
+
+    Some(rect.left() + playhead_beats * (rect.width() / visible_beats))
 }
 
 fn grid_total_beats(viewport: PianoRollViewport) -> f32 {
