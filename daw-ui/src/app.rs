@@ -98,20 +98,20 @@ impl eframe::App for DawUiApp {
                     self.explorer.show(ui);
                 });
 
+                let mut active_track = self.playlist.active_track_snapshot();
+                let piano_roll_tracks = self.playlist.piano_roll_tracks();
+                let piano_roll_blocks_pointer = self.piano_roll.show_window(
+                    ctx,
+                    &mut self.piano_roll_open,
+                    &mut active_track,
+                    &piano_roll_tracks,
+                );
+                self.playlist.set_active_track_notes(active_track.notes);
+
                 ui.scope_builder(egui::UiBuilder::new().max_rect(workspace_rect), |ui| {
-                    self.playlist.show(ui);
+                    self.playlist.show(ui, !piano_roll_blocks_pointer);
                 });
             });
-
-        let mut active_track = self.playlist.active_track_snapshot();
-        let piano_roll_tracks = self.playlist.piano_roll_tracks();
-        self.piano_roll.show_window(
-            ctx,
-            &mut self.piano_roll_open,
-            &mut active_track,
-            &piano_roll_tracks,
-        );
-        self.playlist.set_active_track_notes(active_track.notes);
     }
 }
 

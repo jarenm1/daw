@@ -11,18 +11,25 @@ const HEADER_HEIGHT: f32 = 38.0;
 const TOOLBAR_HEIGHT: f32 = 38.0;
 const KEYBOARD_WIDTH: f32 = 88.0;
 const ROW_HEIGHT: f32 = 22.0;
-const BEAT_WIDTH: f32 = 56.0;
 const SNAP_BEATS: f32 = 0.25;
 const MIN_NOTE_LENGTH: f32 = SNAP_BEATS;
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
-const NOTE_ROWS: usize = 18;
-const TOP_MIDI_NOTE: i32 = 79;
+const TOP_MIDI_NOTE: i32 = 120; // C9
+const BOTTOM_MIDI_NOTE: i32 = 12; // C0
+const NOTE_ROWS: usize = (TOP_MIDI_NOTE - BOTTOM_MIDI_NOTE + 1) as usize;
+const DEFAULT_VISIBLE_BARS: f32 = 4.0;
+const MIN_VISIBLE_BARS: f32 = 1.0;
+const MAX_VISIBLE_BARS: f32 = 32.0;
+const SCROLL_SENSITIVITY: f32 = 0.7;
+const ZOOM_SENSITIVITY: f32 = 0.01;
 
 pub struct PianoRollView {
     active_tool: PianoRollTool,
     ghost_notes_enabled: bool,
     ghost_track_indices: BTreeSet<usize>,
     note_drag: Option<NoteDrag>,
+    viewport: PianoRollViewport,
+    scale_highlight: ScaleHighlight,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +68,36 @@ struct NoteHit {
     edge: Option<ResizeEdge>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PianoRollViewport {
+    visible_bars: f32,
+    vertical_scroll: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScaleHighlight {
+    enabled: bool,
+    root_note_class: usize,
+    preset: ScalePreset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalePreset {
+    Major,
+    Minor,
+    Dorian,
+    Phrygian,
+    Lydian,
+    Mixolydian,
+    Locrian,
+    HarmonicMinor,
+    MelodicMinor,
+    MajorPentatonic,
+    MinorPentatonic,
+    Blues,
+    Chromatic,
+}
+
 impl PianoRollView {
     pub fn new() -> Self {
         Self {
@@ -68,6 +105,8 @@ impl PianoRollView {
             ghost_notes_enabled: false,
             ghost_track_indices: BTreeSet::new(),
             note_drag: None,
+            viewport: PianoRollViewport::new(),
+            scale_highlight: ScaleHighlight::default(),
         }
     }
 
@@ -77,7 +116,7 @@ impl PianoRollView {
         open: &mut bool,
         active_track: &mut PianoRollTrackSnapshot,
         piano_roll_tracks: &[PianoRollTrackSnapshot],
-    ) {
+    ) -> bool {
         if self
             .note_drag
             .is_some_and(|drag| drag.track_index != active_track.track_index)
@@ -103,7 +142,7 @@ impl PianoRollView {
             self.ghost_notes_enabled = false;
         }
 
-        egui::Window::new(active_track.name.as_str())
+        let window_response = egui::Window::new(active_track.name.as_str())
             .id(egui::Id::new("piano_roll_window"))
             .open(open)
             .default_size(egui::vec2(960.0, 560.0))
@@ -116,6 +155,15 @@ impl PianoRollView {
             .show(ctx, |ui| {
                 self.show_contents(ui, active_track, &ghost_candidates);
             });
+
+        window_response.is_some_and(|response| {
+            ctx.input(|input| {
+                input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|pos| response.response.rect.contains(pos))
+            })
+        })
     }
 
     fn show_contents(
@@ -213,6 +261,84 @@ impl PianoRollView {
 
                 ui.separator();
 
+                let scale_enabled = active_track.kind == TrackKind::PianoRoll;
+                let scale_active = scale_enabled && self.scale_highlight.enabled;
+                let scale_label = if scale_active {
+                    format!(
+                        "{} {}",
+                        note_class_label(self.scale_highlight.root_note_class),
+                        self.scale_highlight.preset.label()
+                    )
+                } else {
+                    "Scale".to_owned()
+                };
+                let scale_response = tool_button(
+                    ui,
+                    ToolIcon::Scale,
+                    &scale_label,
+                    scale_active,
+                    scale_enabled,
+                );
+                if scale_response.clicked() && scale_enabled {
+                    self.scale_highlight.enabled = !self.scale_highlight.enabled;
+                }
+                scale_response.context_menu(|ui| {
+                    ui.set_min_width(220.0);
+                    ui.label(
+                        egui::RichText::new("Scale Highlight")
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Pick a root note, then choose the scale to highlight in the grid.",
+                        )
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.separator();
+
+                    if active_track.kind != TrackKind::PianoRoll {
+                        ui.label(
+                            egui::RichText::new("Select a note track to configure scales.")
+                                .size(11.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                        return;
+                    }
+
+                    if ui
+                        .button(if self.scale_highlight.enabled {
+                            "Disable Highlight"
+                        } else {
+                            "Enable Current Scale"
+                        })
+                        .clicked()
+                    {
+                        self.scale_highlight.enabled = !self.scale_highlight.enabled;
+                        ui.close();
+                    }
+                    ui.separator();
+
+                    for root_note_class in 0..12 {
+                        ui.menu_button(note_class_label(root_note_class), |ui| {
+                            for preset in ScalePreset::ALL {
+                                let selected = self.scale_highlight.enabled
+                                    && self.scale_highlight.root_note_class == root_note_class
+                                    && self.scale_highlight.preset == preset;
+                                if ui.selectable_label(selected, preset.label()).clicked() {
+                                    self.scale_highlight.enabled = true;
+                                    self.scale_highlight.root_note_class = root_note_class;
+                                    self.scale_highlight.preset = preset;
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                });
+
+                ui.separator();
+
                 let ghost_count = ghost_candidates
                     .iter()
                     .filter(|track| self.ghost_track_indices.contains(&track.track_index))
@@ -289,7 +415,8 @@ impl PianoRollView {
 
                 ui.separator();
                 status_chip(ui, "Snap 1/16");
-                status_chip(ui, "Velocity");
+                status_chip(ui, &format!("Bars {:.1}", self.viewport.visible_bars));
+                status_chip(ui, &self.scale_highlight.summary());
                 status_chip(
                     ui,
                     if ghost_active {
@@ -309,7 +436,7 @@ impl PianoRollView {
         ghost_candidates: &[&PianoRollTrackSnapshot],
     ) {
         let available = ui.available_size_before_wrap();
-        let (rect, _) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+        let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let painter = ui.painter().clone();
 
         painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::SURFACE_0);
@@ -326,9 +453,25 @@ impl PianoRollView {
         );
         let grid_rect =
             egui::Rect::from_min_max(egui::pos2(keyboard_rect.right(), rect.top()), rect.max);
+        let content_height = NOTE_ROWS as f32 * ROW_HEIGHT;
+        self.viewport
+            .apply_input(ui, response.hovered(), rect.height(), content_height);
 
-        draw_keyboard(&painter, keyboard_rect);
-        draw_grid(&painter, grid_rect);
+        let keyboard_painter = painter.with_clip_rect(keyboard_rect);
+        let grid_painter = painter.with_clip_rect(grid_rect);
+
+        draw_keyboard(
+            &keyboard_painter,
+            keyboard_rect,
+            self.viewport,
+            self.scale_highlight,
+        );
+        draw_grid(
+            &grid_painter,
+            grid_rect,
+            self.viewport,
+            self.scale_highlight,
+        );
 
         if self.ghost_notes_enabled {
             let selected_ghost_tracks: Vec<&PianoRollTrackSnapshot> = ghost_candidates
@@ -336,11 +479,16 @@ impl PianoRollView {
                 .copied()
                 .filter(|track| self.ghost_track_indices.contains(&track.track_index))
                 .collect();
-            draw_ghost_tracks(&painter, grid_rect, &selected_ghost_tracks);
+            draw_ghost_tracks(
+                &grid_painter,
+                grid_rect,
+                &selected_ghost_tracks,
+                self.viewport,
+            );
         }
 
-        self.handle_note_interactions(ui, grid_rect, active_track);
-        draw_active_notes(&painter, grid_rect, &active_track.notes);
+        self.handle_note_interactions(ui, grid_rect, active_track, self.viewport);
+        draw_active_notes(&grid_painter, grid_rect, &active_track.notes, self.viewport);
 
         painter.line_segment(
             [
@@ -356,6 +504,7 @@ impl PianoRollView {
         ui: &mut egui::Ui,
         grid_rect: egui::Rect,
         active_track: &mut PianoRollTrackSnapshot,
+        viewport: PianoRollViewport,
     ) {
         if self.active_tool != PianoRollTool::Draw {
             self.note_drag = None;
@@ -364,12 +513,12 @@ impl PianoRollView {
 
         let pointer_pos = ui.input(|input| input.pointer.interact_pos());
         let pointer_inside_grid = pointer_pos.is_some_and(|pos| grid_rect.contains(pos));
-        let pointer_beat = pointer_pos.map(|pos| pos_to_beat(grid_rect, pos));
-        let pointer_lane = pointer_pos.map(|pos| pos_to_lane(grid_rect, pos));
+        let pointer_beat = pointer_pos.map(|pos| pos_to_beat(grid_rect, pos, viewport));
+        let pointer_lane = pointer_pos.map(|pos| pos_to_lane(grid_rect, pos, viewport));
 
         if pointer_inside_grid {
             if let Some(pos) = pointer_pos {
-                match note_hit_test(grid_rect, &active_track.notes, pos) {
+                match note_hit_test(grid_rect, &active_track.notes, pos, viewport) {
                     Some(NoteHit { edge: Some(_), .. }) => ui.output_mut(|output| {
                         output.cursor_icon = egui::CursorIcon::ResizeHorizontal;
                     }),
@@ -391,6 +540,7 @@ impl PianoRollView {
                     grid_rect,
                     pos,
                     active_track,
+                    viewport,
                     ui.input(|input| input.modifiers.alt),
                 );
             }
@@ -400,7 +550,7 @@ impl PianoRollView {
             ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary));
         if secondary_pressed && pointer_inside_grid {
             if let Some(pos) = pointer_pos {
-                if let Some(hit) = note_hit_test(grid_rect, &active_track.notes, pos) {
+                if let Some(hit) = note_hit_test(grid_rect, &active_track.notes, pos, viewport) {
                     active_track.notes.remove(hit.note_index);
                     self.note_drag = None;
                 }
@@ -417,6 +567,7 @@ impl PianoRollView {
                     pointer_beat,
                     pointer_lane,
                     grid_rect,
+                    viewport,
                     free_drag,
                 );
             }
@@ -431,12 +582,13 @@ impl PianoRollView {
         grid_rect: egui::Rect,
         pointer_pos: egui::Pos2,
         active_track: &mut PianoRollTrackSnapshot,
+        viewport: PianoRollViewport,
         free_drag: bool,
     ) {
-        let pointer_beat = pos_to_beat(grid_rect, pointer_pos);
-        let pointer_lane = pos_to_lane(grid_rect, pointer_pos);
+        let pointer_beat = pos_to_beat(grid_rect, pointer_pos, viewport);
+        let pointer_lane = pos_to_lane(grid_rect, pointer_pos, viewport);
 
-        if let Some(hit) = note_hit_test(grid_rect, &active_track.notes, pointer_pos) {
+        if let Some(hit) = note_hit_test(grid_rect, &active_track.notes, pointer_pos, viewport) {
             let note = active_track.notes[hit.note_index].clone();
             let mode = match hit.edge {
                 Some(edge) => {
@@ -470,6 +622,7 @@ impl PianoRollView {
                 pointer_beat,
                 pointer_lane,
                 grid_rect,
+                viewport,
                 free_drag,
             );
             return;
@@ -495,6 +648,7 @@ impl PianoRollView {
             pointer_beat,
             pointer_lane,
             grid_rect,
+            viewport,
             free_drag,
         );
     }
@@ -504,7 +658,8 @@ impl PianoRollView {
         active_track: &mut PianoRollTrackSnapshot,
         pointer_beat: f32,
         pointer_lane: usize,
-        grid_rect: egui::Rect,
+        _grid_rect: egui::Rect,
+        viewport: PianoRollViewport,
         free_drag: bool,
     ) {
         let Some(drag) = self.note_drag else {
@@ -515,7 +670,7 @@ impl PianoRollView {
             return;
         }
 
-        let grid_beats = grid_total_beats(grid_rect);
+        let grid_beats = grid_total_beats(viewport);
         let Some(note) = active_track.notes.get_mut(drag.note_index) else {
             self.note_drag = None;
             return;
@@ -571,6 +726,138 @@ impl Default for PianoRollView {
     }
 }
 
+impl PianoRollViewport {
+    fn new() -> Self {
+        Self {
+            visible_bars: DEFAULT_VISIBLE_BARS,
+            vertical_scroll: 0.0,
+        }
+    }
+
+    fn apply_input(
+        &mut self,
+        ui: &egui::Ui,
+        hovered: bool,
+        viewport_height: f32,
+        content_height: f32,
+    ) {
+        self.clamp_scroll(viewport_height, content_height);
+        if !hovered {
+            return;
+        }
+
+        let (scroll_y, ctrl_held) = ui.input(|input| {
+            let delta = if input.smooth_scroll_delta.y.abs() > f32::EPSILON {
+                input.smooth_scroll_delta.y
+            } else {
+                input.raw_scroll_delta.y
+            };
+            (delta, input.modifiers.ctrl)
+        });
+        if scroll_y.abs() <= f32::EPSILON {
+            return;
+        }
+
+        if ctrl_held {
+            self.visible_bars = zoom_visible_bars(self.visible_bars, scroll_y);
+        } else {
+            self.vertical_scroll -= scroll_y * SCROLL_SENSITIVITY;
+            self.clamp_scroll(viewport_height, content_height);
+        }
+    }
+
+    fn clamp_scroll(&mut self, viewport_height: f32, content_height: f32) {
+        let max_scroll = (content_height - viewport_height).max(0.0);
+        self.vertical_scroll = self.vertical_scroll.clamp(0.0, max_scroll);
+    }
+}
+
+impl Default for ScaleHighlight {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            root_note_class: 0,
+            preset: ScalePreset::Major,
+        }
+    }
+}
+
+impl ScaleHighlight {
+    fn summary(self) -> String {
+        if self.enabled {
+            format!(
+                "{} {}",
+                note_class_label(self.root_note_class),
+                self.preset.label()
+            )
+        } else {
+            "Scale Off".to_owned()
+        }
+    }
+
+    fn contains_midi_note(self, midi_note: i32) -> bool {
+        let note_class = midi_note.rem_euclid(12) as usize;
+        self.preset
+            .intervals()
+            .iter()
+            .any(|interval| (self.root_note_class + interval) % 12 == note_class)
+    }
+}
+
+impl ScalePreset {
+    const ALL: [Self; 13] = [
+        Self::Major,
+        Self::Minor,
+        Self::Dorian,
+        Self::Phrygian,
+        Self::Lydian,
+        Self::Mixolydian,
+        Self::Locrian,
+        Self::HarmonicMinor,
+        Self::MelodicMinor,
+        Self::MajorPentatonic,
+        Self::MinorPentatonic,
+        Self::Blues,
+        Self::Chromatic,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Major => "Major",
+            Self::Minor => "Minor",
+            Self::Dorian => "Dorian",
+            Self::Phrygian => "Phrygian",
+            Self::Lydian => "Lydian",
+            Self::Mixolydian => "Mixolydian",
+            Self::Locrian => "Locrian",
+            Self::HarmonicMinor => "Harmonic Minor",
+            Self::MelodicMinor => "Melodic Minor",
+            Self::MajorPentatonic => "Major Pentatonic",
+            Self::MinorPentatonic => "Minor Pentatonic",
+            Self::Blues => "Blues",
+            Self::Chromatic => "Chromatic",
+        }
+    }
+
+    const fn intervals(self) -> &'static [usize] {
+        match self {
+            Self::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Self::Minor => &[0, 2, 3, 5, 7, 8, 10],
+            Self::Dorian => &[0, 2, 3, 5, 7, 9, 10],
+            Self::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
+            Self::Lydian => &[0, 2, 4, 6, 7, 9, 11],
+            Self::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
+            Self::Locrian => &[0, 1, 3, 5, 6, 8, 10],
+            Self::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
+            Self::MelodicMinor => &[0, 2, 3, 5, 7, 9, 11],
+            Self::MajorPentatonic => &[0, 2, 4, 7, 9],
+            Self::MinorPentatonic => &[0, 3, 5, 7, 10],
+            Self::Blues => &[0, 3, 5, 6, 7, 10],
+            Self::Chromatic => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PianoRollTool {
     Select,
@@ -607,30 +894,27 @@ enum ToolIcon {
     Draw,
     Split,
     Mute,
+    Scale,
     Ghost,
 }
 
-fn draw_keyboard(painter: &egui::Painter, rect: egui::Rect) {
+fn draw_keyboard(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    viewport: PianoRollViewport,
+    scale_highlight: ScaleHighlight,
+) {
     painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::SURFACE_1);
 
     for lane in 0..NOTE_ROWS {
-        let top = rect.top() + lane as f32 * ROW_HEIGHT;
-        if top >= rect.bottom() {
-            break;
-        }
+        let top = rect.top() - viewport.vertical_scroll + lane as f32 * ROW_HEIGHT;
 
         let row_rect = egui::Rect::from_min_max(
             egui::pos2(rect.left(), top),
             egui::pos2(rect.right(), (top + ROW_HEIGHT).min(rect.bottom())),
         );
         let midi_note = TOP_MIDI_NOTE - lane as i32;
-        let fill = if is_black_key(midi_note) {
-            theme::SURFACE_2
-        } else if lane % 2 == 0 {
-            theme::SURFACE_1
-        } else {
-            theme::SURFACE_0
-        };
+        let fill = keyboard_row_fill(midi_note, lane, scale_highlight);
 
         painter.rect_filled(row_rect, egui::CornerRadius::ZERO, fill);
         painter.line_segment(
@@ -647,27 +931,23 @@ fn draw_keyboard(painter: &egui::Painter, rect: egui::Rect) {
     }
 }
 
-fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
+fn draw_grid(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    viewport: PianoRollViewport,
+    scale_highlight: ScaleHighlight,
+) {
     painter.rect_filled(rect, egui::CornerRadius::ZERO, theme::SURFACE_0);
 
     for lane in 0..NOTE_ROWS {
-        let top = rect.top() + lane as f32 * ROW_HEIGHT;
-        if top >= rect.bottom() {
-            break;
-        }
+        let top = rect.top() - viewport.vertical_scroll + lane as f32 * ROW_HEIGHT;
 
         let row_rect = egui::Rect::from_min_max(
             egui::pos2(rect.left(), top),
             egui::pos2(rect.right(), (top + ROW_HEIGHT).min(rect.bottom())),
         );
         let midi_note = TOP_MIDI_NOTE - lane as i32;
-        let fill = if is_black_key(midi_note) {
-            theme::GRID_MINOR
-        } else if lane % 2 == 0 {
-            theme::SURFACE_0
-        } else {
-            theme::SURFACE_1
-        };
+        let fill = grid_row_fill(midi_note, lane, scale_highlight);
         painter.rect_filled(row_rect, egui::CornerRadius::ZERO, fill);
         painter.line_segment(
             [row_rect.left_bottom(), row_rect.right_bottom()],
@@ -675,9 +955,11 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
         );
     }
 
+    let beat_width = beat_width(rect, viewport);
+    let visible_beats = grid_total_beats(viewport) as usize;
     let mut beat = 0;
     let mut x = rect.left();
-    while x <= rect.right() {
+    while beat <= visible_beats {
         let color = if beat % 4 == 0 {
             theme::GRID_MAJOR
         } else {
@@ -689,7 +971,7 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
             egui::Stroke::new(width, color),
         );
 
-        if x + BEAT_WIDTH < rect.right() {
+        if x + beat_width < rect.right() {
             painter.text(
                 egui::pos2(x + 6.0, rect.top() + 10.0),
                 egui::Align2::LEFT_CENTER,
@@ -699,7 +981,7 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
             );
         }
 
-        x += BEAT_WIDTH;
+        x += beat_width;
         beat += 1;
     }
 }
@@ -708,14 +990,20 @@ fn draw_ghost_tracks(
     painter: &egui::Painter,
     rect: egui::Rect,
     tracks: &[&PianoRollTrackSnapshot],
+    viewport: PianoRollViewport,
 ) {
     for (slot, track) in tracks.iter().enumerate() {
         let (fill, stroke) = ghost_palette(slot);
-        draw_notes(painter, rect, &track.notes, fill, stroke, true);
+        draw_notes(painter, rect, &track.notes, fill, stroke, true, viewport);
     }
 }
 
-fn draw_active_notes(painter: &egui::Painter, rect: egui::Rect, notes: &[PianoRollNoteData]) {
+fn draw_active_notes(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    notes: &[PianoRollNoteData],
+    viewport: PianoRollViewport,
+) {
     draw_notes(
         painter,
         rect,
@@ -723,6 +1011,7 @@ fn draw_active_notes(painter: &egui::Painter, rect: egui::Rect, notes: &[PianoRo
         theme::ACCENT,
         theme::ACCENT_HOVER,
         false,
+        viewport,
     );
 }
 
@@ -733,9 +1022,10 @@ fn draw_notes(
     fill_color: egui::Color32,
     stroke_color: egui::Color32,
     ghost: bool,
+    viewport: PianoRollViewport,
 ) {
     for note in notes {
-        let note_rect = note_rect(rect, note);
+        let note_rect = note_rect(rect, note, viewport);
 
         if note_rect.top() >= rect.bottom() || note_rect.left() >= rect.right() {
             continue;
@@ -767,6 +1057,15 @@ fn draw_notes(
             egui::StrokeKind::Inside,
         );
         if !ghost {
+            if note_rect.width() > 30.0 {
+                painter.text(
+                    egui::pos2(note_rect.left() + 6.0, note_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    lane_note_label(note.lane),
+                    egui::FontId::proportional(10.0),
+                    theme::TEXT,
+                );
+            }
             painter.line_segment(
                 [
                     egui::pos2(note_rect.left() + 10.0, note_rect.bottom() - 4.0),
@@ -888,6 +1187,7 @@ fn icon_source(icon: ToolIcon) -> egui::ImageSource<'static> {
         ToolIcon::Draw => egui::include_image!("../assets/piano_roll_tools/draw.svg"),
         ToolIcon::Split => egui::include_image!("../assets/piano_roll_tools/split.svg"),
         ToolIcon::Mute => egui::include_image!("../assets/piano_roll_tools/mute.svg"),
+        ToolIcon::Scale => egui::include_image!("../assets/piano_roll_tools/scale.svg"),
         ToolIcon::Ghost => egui::include_image!("../assets/piano_roll_tools/ghost.svg"),
     }
 }
@@ -896,9 +1196,10 @@ fn note_hit_test(
     rect: egui::Rect,
     notes: &[PianoRollNoteData],
     pos: egui::Pos2,
+    viewport: PianoRollViewport,
 ) -> Option<NoteHit> {
     for (note_index, note) in notes.iter().enumerate().rev() {
-        let note_rect = note_rect(rect, note);
+        let note_rect = note_rect(rect, note, viewport);
         if !note_rect.contains(pos) {
             continue;
         }
@@ -917,26 +1218,79 @@ fn note_hit_test(
     None
 }
 
-fn note_rect(rect: egui::Rect, note: &PianoRollNoteData) -> egui::Rect {
-    let top = rect.top() + note.lane as f32 * ROW_HEIGHT + 3.0;
+fn note_rect(
+    rect: egui::Rect,
+    note: &PianoRollNoteData,
+    viewport: PianoRollViewport,
+) -> egui::Rect {
+    let top = rect.top() - viewport.vertical_scroll + note.lane as f32 * ROW_HEIGHT + 3.0;
     let bottom = (top + ROW_HEIGHT - 6.0).min(rect.bottom() - 2.0);
-    let left = rect.left() + note.start_beat * BEAT_WIDTH;
-    let right = (left + note.length_beats * BEAT_WIDTH).min(rect.right() - 3.0);
+    let beat_width = beat_width(rect, viewport);
+    let left = rect.left() + note.start_beat * beat_width;
+    let right = (left + note.length_beats * beat_width).min(rect.right() - 3.0);
     egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
 }
 
-fn pos_to_lane(rect: egui::Rect, pos: egui::Pos2) -> usize {
-    ((pos.y - rect.top()) / ROW_HEIGHT)
+fn pos_to_lane(rect: egui::Rect, pos: egui::Pos2, viewport: PianoRollViewport) -> usize {
+    ((pos.y - rect.top() + viewport.vertical_scroll) / ROW_HEIGHT)
         .floor()
         .clamp(0.0, (NOTE_ROWS - 1) as f32) as usize
 }
 
-fn pos_to_beat(rect: egui::Rect, pos: egui::Pos2) -> f32 {
-    ((pos.x - rect.left()) / BEAT_WIDTH).clamp(0.0, grid_total_beats(rect))
+fn pos_to_beat(rect: egui::Rect, pos: egui::Pos2, viewport: PianoRollViewport) -> f32 {
+    ((pos.x - rect.left()) / beat_width(rect, viewport)).clamp(0.0, grid_total_beats(viewport))
 }
 
-fn grid_total_beats(rect: egui::Rect) -> f32 {
-    (rect.width() / BEAT_WIDTH).max(MIN_NOTE_LENGTH)
+fn beat_width(rect: egui::Rect, viewport: PianoRollViewport) -> f32 {
+    rect.width() / grid_total_beats(viewport)
+}
+
+fn grid_total_beats(viewport: PianoRollViewport) -> f32 {
+    (viewport.visible_bars * 4.0).max(MIN_NOTE_LENGTH)
+}
+
+fn zoom_visible_bars(current: f32, scroll_y: f32) -> f32 {
+    (current * (-scroll_y * ZOOM_SENSITIVITY).exp()).clamp(MIN_VISIBLE_BARS, MAX_VISIBLE_BARS)
+}
+
+fn keyboard_row_fill(
+    midi_note: i32,
+    lane: usize,
+    scale_highlight: ScaleHighlight,
+) -> egui::Color32 {
+    if scale_highlight.enabled {
+        return if scale_highlight.contains_midi_note(midi_note) {
+            theme::SURFACE_1
+        } else {
+            theme::SURFACE_0
+        };
+    }
+
+    if is_black_key(midi_note) {
+        theme::SURFACE_2
+    } else if lane % 2 == 0 {
+        theme::SURFACE_1
+    } else {
+        theme::SURFACE_0
+    }
+}
+
+fn grid_row_fill(midi_note: i32, lane: usize, scale_highlight: ScaleHighlight) -> egui::Color32 {
+    if scale_highlight.enabled {
+        return if scale_highlight.contains_midi_note(midi_note) {
+            theme::SURFACE_1
+        } else {
+            theme::SURFACE_0
+        };
+    }
+
+    if is_black_key(midi_note) {
+        theme::GRID_MINOR
+    } else if lane % 2 == 0 {
+        theme::SURFACE_0
+    } else {
+        theme::SURFACE_1
+    }
 }
 
 fn quantize_beat(beat: f32, free_drag: bool) -> f32 {
@@ -977,6 +1331,17 @@ fn note_label(midi_note: i32) -> String {
     let note_index = midi_note.rem_euclid(12) as usize;
     let octave = midi_note.div_euclid(12) - 1;
     format!("{}{}", NAMES[note_index], octave)
+}
+
+fn lane_note_label(lane: usize) -> String {
+    note_label(TOP_MIDI_NOTE - lane as i32)
+}
+
+fn note_class_label(note_class: usize) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    NAMES[note_class % 12]
 }
 
 fn is_black_key(midi_note: i32) -> bool {
