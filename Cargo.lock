@@ -1045,9 +1045,11 @@ dependencies = [
 name = "daw_ui"
 version = "0.1.0"
 dependencies = [
+ "daw_audio_engine",
  "eframe",
  "egui",
  "egui_extras",
+ "parking_lot",
 ]
 
 [[package]]

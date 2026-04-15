@@ -24,6 +24,10 @@ const MAX_VISIBLE_BARS: f32 = 32.0;
 const SCROLL_SENSITIVITY: f32 = 0.7;
 const ZOOM_SENSITIVITY: f32 = 0.01;
 
+pub fn lane_to_midi_note(lane: usize) -> u8 {
+    (TOP_MIDI_NOTE - lane as i32).clamp(0, 127) as u8
+}
+
 pub struct PianoRollWindowOutput {
     pub blocks_pointer: bool,
     pub seek_to_beat: Option<f32>,

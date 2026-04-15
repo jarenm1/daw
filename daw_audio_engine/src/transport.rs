@@ -93,9 +93,6 @@ impl Transport {
 
     /// Start playback
     pub fn play(&mut self) {
-        if self.state == TransportState::Stopped {
-            self.position = 0.0;
-        }
         self.state = TransportState::Playing;
         self.update_shared();
     }

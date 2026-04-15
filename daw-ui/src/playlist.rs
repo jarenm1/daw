@@ -23,7 +23,7 @@ pub enum TrackKind {
     Audio,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PianoRollNoteData {
     pub lane: usize,
     pub start_beat: f32,
@@ -40,6 +40,37 @@ pub struct PianoRollTrackSnapshot {
     pub notes: Vec<PianoRollNoteData>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ArrangementClipSnapshot {
+    pub label: String,
+    pub start_beat: f32,
+    pub length_beats: f32,
+    pub muted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArrangementTrackSnapshot {
+    pub name: String,
+    pub kind: TrackKind,
+    pub instrument_name: Option<String>,
+    pub muted: bool,
+    pub notes: Vec<PianoRollNoteData>,
+    pub clips: Vec<ArrangementClipSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrackInstrument {
+    SimpleSynth,
+}
+
+impl TrackInstrument {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SimpleSynth => "SimpleSynth",
+        }
+    }
+}
+
 pub struct PlaylistView {
     active_tool: PlaylistTool,
     selected_track: usize,
@@ -47,6 +78,7 @@ pub struct PlaylistView {
     clip_drag: Option<ClipDrag>,
     timeline_scrubbing: bool,
     next_clip_id: usize,
+    revision: u64,
     viewport: PlaylistViewport,
     tracks: Vec<PlaylistTrack>,
 }
@@ -101,21 +133,16 @@ struct PlaylistViewport {
 
 impl PlaylistView {
     pub fn new() -> Self {
-        let tracks = sample_tracks();
-        let next_clip_id = tracks
-            .iter()
-            .flat_map(|track| track.clips.iter().map(|clip| clip.id))
-            .max()
-            .map_or(0, |id| id + 1);
         Self {
             active_tool: PlaylistTool::Select,
             selected_track: 0,
             selected_clip: None,
             clip_drag: None,
             timeline_scrubbing: false,
-            next_clip_id,
+            next_clip_id: 0,
+            revision: 0,
             viewport: PlaylistViewport::new(),
-            tracks,
+            tracks: Vec::new(),
         }
     }
 
@@ -150,10 +177,40 @@ impl PlaylistView {
 
     pub fn set_active_track_notes(&mut self, notes: Vec<PianoRollNoteData>) {
         if let Some(track) = self.tracks.get_mut(self.selected_track) {
-            if track.kind == TrackKind::PianoRoll {
+            if track.kind == TrackKind::PianoRoll && track.notes != notes {
                 track.notes = notes;
+                self.mark_dirty();
             }
         }
+    }
+
+    pub fn arrangement_tracks(&self) -> Vec<ArrangementTrackSnapshot> {
+        self.tracks
+            .iter()
+            .map(|track| ArrangementTrackSnapshot {
+                name: track.name.clone(),
+                kind: track.kind,
+                instrument_name: track
+                    .instrument
+                    .map(|instrument| instrument.label().to_owned()),
+                muted: track.muted,
+                notes: track.notes.clone(),
+                clips: track
+                    .clips
+                    .iter()
+                    .map(|clip| ArrangementClipSnapshot {
+                        label: clip.label.clone(),
+                        start_beat: clip.start_beat,
+                        length_beats: clip.length_beats,
+                        muted: clip.muted,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn show(
@@ -232,6 +289,17 @@ impl PlaylistView {
                 }
 
                 ui.separator();
+                ui.menu_button("Add Track", |ui| {
+                    if ui.button("SimpleSynth").clicked() {
+                        self.add_track(
+                            "Track",
+                            TrackKind::PianoRoll,
+                            Some(TrackInstrument::SimpleSynth),
+                        );
+                        ui.close();
+                    }
+                });
+                ui.separator();
                 status_chip(ui, "Snap 1/16");
                 status_chip(ui, &format!("Bars {:.1}", self.viewport.visible_bars));
                 status_chip(
@@ -244,6 +312,8 @@ impl PlaylistView {
                 );
                 if let Some(summary) = &selected_clip_summary {
                     status_chip(ui, summary);
+                } else if self.tracks.is_empty() {
+                    status_chip(ui, "No Tracks");
                 }
             });
         });
@@ -681,6 +751,7 @@ impl PlaylistView {
             if let Some(track) = self.tracks.get_mut(drag.track_index) {
                 sort_clips(&mut track.clips);
             }
+            self.mark_dirty();
         }
     }
 
@@ -695,6 +766,7 @@ impl PlaylistView {
             muted: false,
         };
         self.tracks[track_index].clips.push(clip);
+        self.mark_dirty();
         clip_id
     }
 
@@ -727,6 +799,7 @@ impl PlaylistView {
             track_index,
             clip_id: new_clip_id,
         });
+        self.mark_dirty();
     }
 
     fn duplicate_clip(&mut self, track_index: usize, clip_id: usize) -> Option<ClipSelection> {
@@ -741,6 +814,7 @@ impl PlaylistView {
         let track = self.tracks.get_mut(track_index)?;
         track.clips.push(duplicate);
         sort_clips(&mut track.clips);
+        self.mark_dirty();
 
         Some(ClipSelection {
             track_index,
@@ -751,6 +825,7 @@ impl PlaylistView {
     fn toggle_clip_mute(&mut self, track_index: usize, clip_id: usize) {
         if let Some(clip) = self.clip_mut(track_index, clip_id) {
             clip.muted = !clip.muted;
+            self.mark_dirty();
         }
     }
 
@@ -774,6 +849,7 @@ impl PlaylistView {
         {
             self.clip_drag = None;
         }
+        self.mark_dirty();
     }
 
     fn clip(&self, track_index: usize, clip_id: usize) -> Option<&PlaylistClipData> {
@@ -801,6 +877,33 @@ impl PlaylistView {
         } else {
             format!("{} · {:.1} bars", clip.label, bars)
         })
+    }
+
+    fn add_track(&mut self, base_name: &str, kind: TrackKind, instrument: Option<TrackInstrument>) {
+        let track_number = self.tracks.len() + 1;
+        let track = match kind {
+            TrackKind::PianoRoll => PlaylistTrack::piano_roll(
+                format!("{base_name} {track_number}"),
+                "Piano roll lane",
+                instrument,
+                Vec::new(),
+                Vec::new(),
+            ),
+            TrackKind::Audio => PlaylistTrack::audio(
+                format!("{base_name} {track_number}"),
+                "Audio lane",
+                Vec::new(),
+            ),
+        };
+        self.tracks.push(track);
+        self.selected_track = self.tracks.len().saturating_sub(1);
+        self.selected_clip = None;
+        self.clip_drag = None;
+        self.mark_dirty();
+    }
+
+    fn mark_dirty(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 
@@ -861,6 +964,8 @@ struct PlaylistTrack {
     name: String,
     lane_label: String,
     kind: TrackKind,
+    instrument: Option<TrackInstrument>,
+    muted: bool,
     notes: Vec<PianoRollNoteData>,
     clips: Vec<PlaylistClipData>,
 }
@@ -869,6 +974,7 @@ impl PlaylistTrack {
     fn piano_roll(
         name: impl Into<String>,
         lane_label: impl Into<String>,
+        instrument: Option<TrackInstrument>,
         notes: Vec<PianoRollNoteData>,
         clips: Vec<PlaylistClipData>,
     ) -> Self {
@@ -876,6 +982,8 @@ impl PlaylistTrack {
             name: name.into(),
             lane_label: lane_label.into(),
             kind: TrackKind::PianoRoll,
+            instrument,
+            muted: false,
             notes,
             clips,
         }
@@ -890,6 +998,8 @@ impl PlaylistTrack {
             name: name.into(),
             lane_label: lane_label.into(),
             kind: TrackKind::Audio,
+            instrument: None,
+            muted: false,
             notes: Vec::new(),
             clips,
         }
@@ -913,99 +1023,6 @@ struct PlaylistClipData {
     start_beat: f32,
     length_beats: f32,
     muted: bool,
-}
-
-fn sample_tracks() -> Vec<PlaylistTrack> {
-    vec![
-        PlaylistTrack::piano_roll(
-            "Drums",
-            "Drum pattern lane",
-            vec![
-                note(15, 0.0, 0.5, 0.92),
-                note(15, 1.0, 0.5, 0.88),
-                note(12, 2.0, 0.5, 0.80),
-                note(15, 3.0, 0.5, 0.90),
-                note(10, 4.5, 0.5, 0.74),
-                note(12, 6.0, 0.5, 0.82),
-            ],
-            vec![
-                clip(0, "Kick Loop", 0.0, 4.0),
-                clip(1, "Fill", 6.0, 2.0),
-                clip(2, "Drop", 8.0, 4.0),
-            ],
-        ),
-        PlaylistTrack::piano_roll(
-            "Bass",
-            "Piano roll lane",
-            vec![
-                note(13, 0.0, 1.0, 0.84),
-                note(11, 1.5, 0.75, 0.79),
-                note(8, 3.0, 1.25, 0.88),
-                note(10, 5.0, 1.0, 0.81),
-                note(6, 6.5, 1.0, 0.76),
-            ],
-            vec![clip(3, "Bassline", 0.0, 8.0), clip(4, "Pickup", 9.0, 3.0)],
-        ),
-        PlaylistTrack::piano_roll(
-            "Keys",
-            "Chord lane",
-            vec![
-                note(12, 0.0, 1.5, 0.74),
-                note(10, 0.0, 1.5, 0.71),
-                note(8, 0.0, 1.5, 0.68),
-                note(11, 2.0, 1.5, 0.75),
-                note(9, 2.0, 1.5, 0.70),
-                note(7, 2.0, 1.5, 0.67),
-                note(10, 4.0, 2.0, 0.78),
-                note(7, 4.0, 2.0, 0.69),
-                note(5, 4.0, 2.0, 0.65),
-            ],
-            vec![
-                clip(5, "Pads", 2.0, 6.0),
-                clip(6, "Bridge Chords", 10.0, 2.0),
-            ],
-        ),
-        PlaylistTrack::piano_roll(
-            "Lead",
-            "Melody lane",
-            vec![
-                note(5, 0.5, 0.75, 0.86),
-                note(6, 1.5, 0.5, 0.81),
-                note(8, 2.25, 1.0, 0.91),
-                note(7, 4.0, 0.5, 0.80),
-                note(9, 5.0, 0.75, 0.89),
-                note(11, 6.0, 1.25, 0.94),
-            ],
-            vec![clip(7, "Hook", 4.0, 4.0), clip(8, "Answer", 9.0, 2.0)],
-        ),
-        PlaylistTrack::audio(
-            "Vox",
-            "Audio lane",
-            vec![
-                clip(9, "Verse Vox", 1.0, 3.0),
-                clip(10, "Chorus Vox", 8.0, 4.0),
-            ],
-        ),
-    ]
-}
-
-fn note(lane: usize, start_beat: f32, length_beats: f32, velocity: f32) -> PianoRollNoteData {
-    PianoRollNoteData {
-        lane,
-        start_beat,
-        length_beats,
-        velocity,
-    }
-}
-
-fn clip(id: usize, label: &str, start_beat: f32, length_beats: f32) -> PlaylistClipData {
-    PlaylistClipData {
-        id,
-        label: label.to_owned(),
-        start_beat,
-        length_beats,
-        muted: false,
-    }
 }
 
 fn default_clip_label(track: &PlaylistTrack) -> String {
@@ -1246,7 +1263,10 @@ fn draw_tracks(
         sidebar_painter.text(
             egui::pos2(track_rect.left() + 14.0, track_rect.top() + 40.0),
             egui::Align2::LEFT_CENTER,
-            track.lane_label.as_str(),
+            track
+                .instrument
+                .map(|instrument| instrument.label())
+                .unwrap_or(track.lane_label.as_str()),
             egui::FontId::proportional(11.0),
             theme::TEXT_MUTED,
         );

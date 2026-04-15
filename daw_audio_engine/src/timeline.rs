@@ -144,6 +144,16 @@ impl Sequencer {
         self.tracks.push(track);
     }
 
+    /// Replace all tracks at once.
+    pub fn set_tracks(&mut self, tracks: Vec<MidiTrack>) {
+        self.tracks = tracks;
+    }
+
+    /// Remove all tracks.
+    pub fn clear_tracks(&mut self) {
+        self.tracks.clear();
+    }
+
     /// Process one audio buffer - generates MIDI events and advances transport
     pub fn process(&mut self, buffer_size: usize) -> Vec<MidiEvent> {
         let mut all_events = Vec::new();
